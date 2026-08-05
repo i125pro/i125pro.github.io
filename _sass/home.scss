@@ -1,54 +1,51 @@
 .hero {
-  padding: 96px 0 64px;
+  padding: 4rem 0 3rem;
 }
-
+.wrap-narrow {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
 .hero-title {
-  font-size: 40px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  margin: 0 0 8px;
+  font-size: clamp(2.25rem, 5vw, 3.25rem);
+  margin: 0 0 0.75rem;
 }
-
 .hero-subtitle {
-  font-size: 18px;
+  font-family: var(--font-mono-accent);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.85rem;
   color: var(--accent);
-  margin: 0 0 16px;
-  font-weight: 500;
+  margin: 0 0 1rem;
 }
-
 .hero-description {
-  font-size: 16px;
-  color: var(--text-muted);
-  margin: 0;
-  max-width: 560px;
+  color: var(--muted);
+  font-size: 1.1rem;
+  max-width: 42rem;
 }
-
 .post-list {
-  padding-bottom: 96px;
+  padding: 0 0 4rem;
 }
-
 .post-item {
   display: flex;
-  align-items: baseline;
   justify-content: space-between;
-  gap: 16px;
-  padding: 16px 0;
-  border-bottom: 1px solid var(--border);
-  transition: opacity 0.15s ease;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 1.1rem 0;
+  border-bottom: 1px solid var(--line);
+  text-decoration: none;
 }
-
-.post-item:hover {
-  opacity: 0.7;
+.post-item:hover .post-item-title {
+  color: var(--accent);
 }
-
 .post-item-title {
-  font-size: 16px;
-  font-weight: 500;
+  font-size: 1.05rem;
+  color: var(--text);
+  transition: color 0.2s ease;
 }
-
 .post-item-date {
-  font-size: 13px;
-  color: var(--text-muted);
-  white-space: nowrap;
   font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
 }

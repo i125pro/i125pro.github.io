@@ -17,6 +17,8 @@ sass:
   sass_dir: _sass
   style: compressed
 
+future: true
+
 permalink: /:year/:month/:day/:title/
 
 collections:

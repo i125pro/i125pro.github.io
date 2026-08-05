@@ -1,39 +1,41 @@
 .page,
-.post {
-  padding: 64px 0 96px;
+.post,
+.archive {
+  padding: 4rem 0 6rem;
 }
 
 .page-title,
 .post-title {
-  font-size: 32px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  margin: 0 0 24px;
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 1.5rem;
 }
 
 .post-header {
-  margin-bottom: 32px;
+  margin-bottom: 2rem;
 }
 
 .post-title {
-  margin-bottom: 8px;
+  margin-bottom: 0.5rem;
 }
 
 .post-meta {
-  font-size: 13px;
-  color: var(--text-muted);
+  font-size: 0.8rem;
+  color: var(--muted);
   font-family: var(--font-mono);
   margin: 0;
 }
 
 .page-content,
 .post-content {
-  font-size: 16px;
+  font-size: 1.0625rem;
 }
 
 .page-content p,
 .post-content p {
-  margin: 0 0 20px;
+  margin: 0 0 1.25rem;
 }
 
 .page-content a,
@@ -51,25 +53,26 @@
 
 .page-content h2,
 .post-content h2 {
-  font-size: 22px;
-  margin: 40px 0 16px;
+  font-family: var(--font-serif);
+  font-size: 1.4rem;
+  margin: 2.5rem 0 1rem;
 }
 
 .page-content code,
 .post-content code {
   font-family: var(--font-mono);
   font-size: 0.9em;
-  background: var(--bg-subtle);
-  padding: 2px 6px;
+  background: var(--panel-soft);
+  padding: 0.1em 0.4em;
   border-radius: 4px;
 }
 
 .page-content pre,
 .post-content pre {
-  background: var(--bg-subtle);
-  border: 1px solid var(--border);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 16px;
+  padding: 1rem;
   overflow-x: auto;
 }
 
@@ -80,26 +83,28 @@
 }
 
 .post-footer {
-  margin-top: 48px;
-  padding-top: 24px;
-  border-top: 1px solid var(--border);
-  font-size: 14px;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.85rem;
 }
 
 .post-footer a {
-  color: var(--text-muted);
+  color: var(--muted);
   transition: color 0.15s ease;
 }
 
 .post-footer a:hover {
-  color: var(--text);
+  color: var(--accent);
 }
 
 .archive-year {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin: 40px 0 12px;
+  font-family: var(--font-mono-accent);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  margin: 2.5rem 0 0.75rem;
 }
 
 .archive-list {
@@ -111,14 +116,14 @@
 .archive-list li {
   display: flex;
   justify-content: space-between;
-  gap: 16px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border);
+  gap: 1rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--line);
 }
 
 .archive-date {
-  font-size: 13px;
-  color: var(--text-muted);
+  font-size: 0.8rem;
+  color: var(--muted);
   font-family: var(--font-mono);
   white-space: nowrap;
 }

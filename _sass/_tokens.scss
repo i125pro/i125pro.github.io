@@ -1,0 +1,28 @@
+// pi.dev-inspired design tokens
+:root {
+  --bg-deep: #0d1116;
+  --bg-canvas: #161d27;
+  --panel: #212730e6;
+  --panel-soft: #252f3dd1;
+  --text: #ebe7e4;
+  --muted: #9fa4abad;
+  --accent: #6a9fcc;
+  --accent-rust: #8f3222;
+  --line: #49505980;
+
+  --font-serif: "Plantin MT Pro", "Plantin MT Std", Plantin, Georgia, serif;
+  --font-mono: "Commit Mono", "SFMono-Regular", Consolas, monospace;
+  --font-mono-accent: "Departure Mono", "Commit Mono", monospace;
+}
+
+[data-theme="light"] {
+  --bg-deep: #dacbc2;
+  --bg-canvas: #ebe7e4;
+  --panel: #f4f2f0e6;
+  --panel-soft: #f4f2f0d1;
+  --text: #252f3df5;
+  --muted: #4b607cad;
+  --accent: #4b607c;
+  --accent-rust: #8f3222;
+  --line: #25303c33;
+}
