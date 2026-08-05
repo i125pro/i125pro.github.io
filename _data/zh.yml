@@ -1,0 +1,29 @@
+nav:
+  home: "首页"
+  about: "关于"
+  projects: "项目"
+  archive: "归档"
+  news: "动态"
+
+hero:
+  title: "i125pro"
+  subtitle: "代码 · 创造 · 分享"
+  description: "欢迎来到我的个人空间，这里记录技术探索、项目实践与生活感悟。"
+
+footer:
+  copyright: "© 2024 i125pro. 保留所有权利。"
+  built_with: "使用 Jekyll 构建，灵感来自 pi.dev"
+
+post:
+  published: "发布于"
+  read_more: "阅读更多"
+  back: "返回文章列表"
+
+theme:
+  dark: "深色模式"
+  light: "浅色模式"
+  system: "跟随系统"
+
+lang:
+  switch: "English"
+  current: "中文"

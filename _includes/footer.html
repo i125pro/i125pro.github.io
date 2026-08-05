@@ -1,0 +1,8 @@
+{% assign lang = page.lang | default: site.default_lang %}
+{% assign t = site.data[lang] %}
+<footer class="site-footer">
+  <div class="wrap">
+    <p>{{ t.footer.copyright }}</p>
+    <p class="built-with">{{ t.footer.built_with }}</p>
+  </div>
+</footer>

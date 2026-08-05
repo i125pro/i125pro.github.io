@@ -1,0 +1,24 @@
+---
+layout: default
+---
+{% assign lang = page.lang | default: site.default_lang %}
+{% assign t = site.data[lang] %}
+<section class="hero">
+  <div class="wrap wrap-narrow">
+    <h1 class="hero-title">{{ t.hero.title }}</h1>
+    <p class="hero-subtitle">{{ t.hero.subtitle }}</p>
+    <p class="hero-description">{{ t.hero.description }}</p>
+  </div>
+</section>
+
+<section class="post-list">
+  <div class="wrap wrap-narrow">
+    {% assign posts = site.posts | where: "lang", lang %}
+    {% for post in posts limit: 8 %}
+    <a class="post-item" href="{{ post.url | relative_url }}">
+      <span class="post-item-title">{{ post.title }}</span>
+      <span class="post-item-date">{{ post.date | date: "%Y-%m-%d" }}</span>
+    </a>
+    {% endfor %}
+  </div>
+</section>

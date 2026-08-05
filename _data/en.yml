@@ -1,0 +1,29 @@
+nav:
+  home: "Home"
+  about: "About"
+  projects: "Projects"
+  archive: "Archive"
+  news: "News"
+
+hero:
+  title: "i125pro"
+  subtitle: "Code · Create · Share"
+  description: "Welcome to my personal space, documenting tech explorations, project practices, and life reflections."
+
+footer:
+  copyright: "© 2024 i125pro. All rights reserved."
+  built_with: "Built with Jekyll, inspired by pi.dev"
+
+post:
+  published: "Published on"
+  read_more: "Read more"
+  back: "Back to posts"
+
+theme:
+  dark: "Dark mode"
+  light: "Light mode"
+  system: "System"
+
+lang:
+  switch: "中文"
+  current: "English"

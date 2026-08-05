@@ -1,0 +1,50 @@
+title: i125pro
+description: A personal blog with pi.dev-inspired design
+url: "https://i125pro.github.io"
+baseurl: ""
+lang: zh
+languages: ["zh", "en"]
+default_lang: "zh"
+
+# Build settings
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    css_class: "highlight"
+
+sass:
+  sass_dir: _sass
+  style: compressed
+
+permalink: /:year/:month/:day/:title/
+
+collections:
+  pages:
+    output: true
+    permalink: /:title/
+
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+      lang: "zh"
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "page"
+      lang: "zh"
+
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor
