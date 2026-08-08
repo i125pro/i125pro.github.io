@@ -50,3 +50,4 @@ exclude:
   - Gemfile.lock
   - node_modules
   - vendor
+  - tools/

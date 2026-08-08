@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>博客编辑器</title>
+<style>
+  :root {
+    --bg: #161d27; --panel: #212730; --text: #ebe7e4;
+    --muted: #9fa4ab; --accent: #6a9fcc; --line: #495059;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: Georgia, serif; display: flex; height: 100vh;
+  }
+  aside {
+    width: 240px; background: var(--panel); border-right: 1px solid var(--line);
+    overflow-y: auto; flex-shrink: 0;
+  }
+  aside h2 {
+    font-size: 0.9rem; padding: 1rem; margin: 0; border-bottom: 1px solid var(--line);
+  }
+  #post-list { list-style: none; margin: 0; padding: 0; }
+  #post-list li {
+    padding: 0.6rem 1rem; cursor: pointer; font-size: 0.85rem;
+    border-bottom: 1px solid var(--line); color: var(--muted);
+  }
+  #post-list li:hover { background: #252f3d; color: var(--text); }
+  main { flex: 1; display: flex; flex-direction: column; padding: 1.5rem; overflow-y: auto; }
+  .row { display: flex; gap: 1rem; margin-bottom: 1rem; }
+  input, select, textarea {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 0.5rem 0.7rem; font-family: inherit; font-size: 1rem;
+  }
+  #title { flex: 1; }
+  #content {
+    flex: 1; resize: none; font-family: "Consolas", monospace; font-size: 0.95rem;
+    line-height: 1.6; min-height: 300px;
+  }
+  button {
+    background: var(--accent); color: #0d1116; border: none; border-radius: 6px;
+    padding: 0.6rem 1.2rem; font-weight: 600; cursor: pointer;
+  }
+  button:hover { opacity: 0.85; }
+  #status { margin-top: 0.75rem; font-size: 0.85rem; color: var(--muted); white-space: pre-wrap; }
+  #new-btn { width: calc(100% - 2rem); margin: 0.75rem 1rem; }
+</style>
+</head>
+<body>
+  <aside>
+    <h2>文章列表</h2>
+    <button id="new-btn">+ 新建文章</button>
+    <ul id="post-list"></ul>
+  </aside>
+  <main>
+    <div class="row">
+      <input id="title" type="text" placeholder="文章标题">
+      <select id="lang">
+        <option value="zh">中文</option>
+        <option value="en">English</option>
+      </select>
+      <button id="save-btn">保存</button>
+    </div>
+    <textarea id="content" placeholder="用 Markdown 写正文..."></textarea>
+    <div id="status"></div>
+  </main>
+  <script>
+    let currentFilename = null;
+
+    async function loadPosts() {
+      const res = await fetch('/api/posts');
+      const posts = await res.json();
+      const list = document.getElementById('post-list');
+      list.innerHTML = '';
+      posts.forEach(p => {
+        const li = document.createElement('li');
+        li.textContent = `[${p.lang}] ${p.title}`;
+        li.onclick = () => openPost(p);
+        list.appendChild(li);
+      });
+    }
+
+    function openPost(p) {
+      currentFilename = p.filename;
+      document.getElementById('title').value = p.title;
+      document.getElementById('lang').value = p.lang;
+      document.getElementById('content').value = p.body;
+      setStatus(`正在编辑: ${p.filename}`);
+    }
+
+    function newPost() {
+      currentFilename = null;
+      document.getElementById('title').value = '';
+      document.getElementById('lang').value = 'zh';
+      document.getElementById('content').value = '';
+      setStatus('新建文章（保存时会自动生成文件名）');
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg;
+    }
+
+    async function savePost() {
+      const title = document.getElementById('title').value.trim();
+      const lang = document.getElementById('lang').value;
+      const content = document.getElementById('content').value;
+      if (!title || !content.trim()) {
+        setStatus('标题和正文不能为空');
+        return;
+      }
+      const res = await fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, lang, content, filename: currentFilename }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        currentFilename = data.filename;
+        setStatus(`已保存: ${data.filename}\n运行 git add -A && git commit -m "..." && git push 上传到网站`);
+        loadPosts();
+      } else {
+        setStatus('保存失败: ' + data.error);
+      }
+    }
+
+    document.getElementById('new-btn').onclick = newPost;
+    document.getElementById('save-btn').onclick = savePost;
+    loadPosts();
+  </script>
+</body>
+</html>

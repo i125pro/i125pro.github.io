@@ -13,7 +13,11 @@ layout: default
       {{ content }}
     </div>
     <footer class="post-footer">
+      {% if lang == "en" %}
+      <a href="{{ '/en/archive/' | relative_url }}">&larr; {{ t.post.back }}</a>
+      {% else %}
       <a href="{{ '/archive/' | relative_url }}">&larr; {{ t.post.back }}</a>
+      {% endif %}
     </footer>
   </div>
 </article>
