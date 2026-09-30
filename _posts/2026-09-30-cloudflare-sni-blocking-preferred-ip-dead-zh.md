@@ -1,6 +1,7 @@
 ---
 title: "你的 Cloudflare 节点全挂了，但问题不在 IP"
 lang: zh
+permalink: /zh/:year/:month/:day/:title/
 description: "10 个优选 IP 节点一夜之间全部失效。IP 没事，服务器没事，Cloudflare 也没封你。是 TLS SNI 字段里的某个字符串被 GFW 匹配到并重置了连接，换任何 IP 都救不回来。"
 keywords: ["CF优选IP失效", "cloudflare 优选ip 不生效", "SNI 拦截", "SNI reset", "connection reset by peer", "cloudflare ip 被阻断", "优选IP节点全部超时", "GFW 阻断域名"]
 mermaid: true
