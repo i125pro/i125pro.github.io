@@ -1,0 +1,30 @@
+{%- comment -%}
+Renders ```mermaid code blocks as diagrams. No-op on pages without mermaid.
+Local copy of mermaid (assets/js/mermaid.min.js) — jsdelivr CDN is unreliable
+for CN readers, and this blog is read mostly from mainland China.
+{%- endcomment -%}
+
+<script src="{{ '/assets/js/mermaid.min.js' | relative_url }}"></script>
+<script>
+  if (window.mermaid) {
+    // ponytail: dark theme overrides so node/edge colors stay readable on this
+    // blog's dark background. Keys are mermaid themeVariables.
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "dark",
+      securityLevel: "loose",
+      themeVariables: {
+        darkMode: true,
+        background: "#12141a",
+        primaryColor: "#1e2430",
+        primaryTextColor: "#e6e6e6",
+        primaryBorderColor: "#4a5568",
+        lineColor: "#8892a4",
+        secondaryColor: "#232936",
+        tertiaryColor: "#1a1f2b",
+        fontSize: "15px"
+      },
+      flowchart: { curve: "basis", htmlLabels: true }
+    });
+  }
+</script>
