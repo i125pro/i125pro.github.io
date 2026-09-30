@@ -9,9 +9,9 @@ mermaid: true
 
 # Cloudflare Preferred IPs Are Not the Problem — Your Domain Name Is
 
-On September 30, 2026, my Cloudflare preferred-IP subscription went from "19 of 20 nodes working" to "every single node dead," overnight, with no change on my end. I spent the next six hours proving that everything I had been taught about preferred IPs was wrong.
+On September 30, 2026 my preferred-IP subscription went from 19 of 20 nodes working to all ten dead, overnight, with no change on my end. I spent the next six hours proving that most of what gets said about preferred IPs is wrong.
 
-The short version: **nothing was wrong with the IPs, the VPS, or Cloudflare. The GFW was resetting every TLS connection whose SNI contained the string `cc.cd`.** No amount of IP swapping fixes that. The only thing that works is a new domain.
+Nothing was broken. Not the IPs, not the VPS, not Cloudflare. The GFW was resetting every TLS connection whose SNI contained the string `cc.cd`. Swapping IPs cannot fix that. Only a new domain can.
 
 ## What the failure looked like
 
@@ -32,7 +32,7 @@ Note what happened: TCP connected fine, then the server reset before the TLS han
 
 ## The three things I tried first (all wrong)
 
-Before I suspected censorship, I ran through the standard troubleshooting playbook. Every step looked reasonable. Every step led nowhere.
+I went through the standard playbook first. Every step looked reasonable. Every step led nowhere.
 
 **Hypothesis 1: my origin server is down.** The obvious check. Same resolver path, same port:
 
@@ -68,7 +68,7 @@ Same failure, unrelated machine. The variable was never the server.
 
 ## The tcpdump line that ended the investigation
 
-Guessing had taken me in circles. So I captured the actual packets on the origin server while the client tried to connect:
+Guessing had taken me in circles, so I captured the actual packets on the origin while the client tried to connect:
 
 ```bash
 # on the origin VPS
@@ -100,11 +100,11 @@ flowchart LR
     style D fill:#3d1f1f,stroke:#a45050,color:#e6e6e6
 ```
 
-The "connection reset by peer" message is the client's own frustration, not a server's rejection. That misreading is what sent me hunting for a firewall rule on a server that never received a single packet.
+The "connection reset by peer" message is the client's own frustration, not a server's rejection. I spent the next hour looking for a firewall rule on a server that never received a single packet.
 
 ## Proving the block is a string match, not a domain
 
-Once I suspected SNI filtering, the test design became obvious: hold the IP constant, vary only the hostname. If the same IP works for one SNI and fails for another, the IP is exonerated and the string is guilty.
+Suspecting SNI filtering makes the test obvious: fix the IP, vary only the hostname. If one SNI works and another fails on the same IP, the IP is exonerated and the string is guilty.
 
 I ran eleven hostnames against one fixed Cloudflare edge IP from the same client:
 
@@ -177,25 +177,25 @@ Fragmentation was on, and the reset still arrived. The filter is not reading one
 
 If the domain name is the problem, the fix is a domain name that is not on the list. I did not have one, so I tested candidates first. `us.ci` and `bot.cd` were not filtered, so I pointed `new.mydomain.example` at Cloudflare and rebuilt the stack.
 
-The change list turned out to be five places, because the domain name is hardcoded in every layer of a CF-proxied VLESS node:
+Five places needed changing, because the domain name is hardcoded in every layer of a CF-proxied VLESS node:
 
-1. **DNS** — an A record for the new name, proxied (orange cloud) through Cloudflare
-2. **Origin certificate** — a self-signed cert covering the new name. Cloudflare's SSL mode had to be `full` (not `strict`), because a self-signed origin cert fails strict validation
-3. **nginx `server_name`** — the origin must answer for the new hostname
-4. **xray's WebSocket `host` field** — this one bit me. 3x-ui persists inbound settings in a SQLite database and regenerates `config.json` from it on every restart, so editing `config.json` directly was silently reverted. The fix had to go into the database, followed by killing a stale xray process that still held port 10086. After that, both the old and new hostnames returned `101 Switching Protocols`
-5. **The subscription generator** — `sni` and `host` parameters in the generated VLESS links, plus the scheduled job that regenerates the subscription, or it silently reverts to the old domain overnight
+1. **DNS**: an A record for the new name, proxied (orange cloud) through Cloudflare
+2. **Origin certificate**: a self-signed cert covering the new name. Cloudflare's SSL mode had to be `full`, not `strict`, because a self-signed origin cert fails strict validation
+3. **nginx `server_name`**: the origin must answer for the new hostname
+4. **xray's WebSocket `host` field**: this one cost me the most time. 3x-ui persists inbound settings in a SQLite database and regenerates `config.json` from it on every restart, so editing `config.json` directly got silently reverted. The fix had to go into the database, followed by killing a stale xray process still holding port 10086. After that, both old and new hostnames returned `101 Switching Protocols`
+5. **The subscription generator**: the `sni` and `host` parameters in the generated VLESS links, plus the scheduled job that regenerates the subscription. Miss that second part and it reverts to the old domain overnight without any error
 
 Result: 14 nodes in the subscription, all passing a real WebSocket 101 handshake check, and a client-side proxy test returning HTTP 204 in 0.4 seconds.
 
-The old domain still works, incidentally. Nothing about the fix required breaking the old setup.
+The old domain still works. Nothing in the fix required breaking the old setup.
 
 ## What actually matters here
 
-The transferable lesson is not "buy a new domain." It is a diagnostic habit.
+The lesson is a diagnostic habit, not a shopping list.
 
-When every node in a preferred-IP subscription fails simultaneously, the failure is almost never per-IP. Simultaneous, total failure points at something shared by all the nodes — and the thing they share is the hostname, because that is what appears in every single ClientHello. Preferred IPs are a bandwidth optimization layered on top of a hostname. When the hostname is the problem, no amount of bandwidth optimization reaches it.
+When every node in a subscription dies at once, the failure is almost never per-IP. Total simultaneous failure points at whatever all the nodes share, and what they share is the hostname, because the hostname is in every ClientHello. Preferred IPs are a bandwidth optimization layered on top of a hostname, and when the hostname is the problem no bandwidth optimization reaches it.
 
-The specific test that resolves this in under a minute:
+This test settles it in under a minute:
 
 ```bash
 # Same IP, two SNI values. This is the whole diagnosis.
@@ -208,7 +208,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" --max-time 8 \
   https://your.domain.here/
 ```
 
-If the first returns 200 and the second resets, your IPs are fine and your domain is the problem. Everything else — swapping providers, tuning `-n` and `-dn` flags, waiting for Cloudflare to lift a ban that was never imposed — is wasted effort.
+If the first returns 200 and the second resets, your IPs are fine and your domain is the problem. Swapping providers, tuning `-n` and `-dn`, or waiting for Cloudflare to lift a ban it never imposed are all wasted effort.
 
 ## Related reading
 
