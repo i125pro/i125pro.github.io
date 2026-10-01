@@ -1,443 +1,318 @@
 ---
-title: "Cloudflare 优选 IP 节点全部失效：SNI 字符串拦截定位与换域名恢复报告"
+title: "Cloudflare 优选 IP 节点全部失效：先别换 IP，问题在域名"
 lang: zh
 permalink: /zh/:year/:month/:day/cloudflare-sni-blocking-preferred-ip-dead/
-description: "10 个优选 IP 节点一夜之间全部 RST。三个合理假设逐个证伪，tcpdump 抓到 RST 源地址是客户端自己。根因是 GFW 按 SNI 字段的字符串匹配拦截，换任何 IP 都无效，只有换域名。"
-keywords: ["CF优选IP失效", "SNI 拦截", "connection reset by peer", "tcpdump 排查", "cloudflare 优选ip 不生效", "SNI reset", "GFW 阻断域名", "网络故障定位"]
+description: "10 个优选 IP 节点在同一分钟全部 RST，但 IP 是好的、源站是好的、Cloudflare 也是好的。真正的原因是链路中间有人读 TLS 握手里的域名（SNI）做字符串匹配，命中就掐。含 30 秒自检命令、5 处修改清单和踩坑记录。"
+keywords: ["CF优选IP失效", "SNI 拦截", "connection reset by peer", "tcpdump 排查", "cloudflare 优选ip 不生效", "优选IP 换域名", "GFW 阻断域名", "网络故障定位"]
 mermaid: true
 ---
 
-# Cloudflare 优选 IP 节点全部失效：SNI 字符串拦截定位与换域名恢复报告
+2026 年 9 月 30 日凌晨，我订阅里的 10 个优选 IP 节点在同一分钟全部失效。我没有动过任何配置。
 
-- **客户端出口**：家宽（主测出口 `198.51.100.77` 段；IPv4 移动、IPv6 联通双出口）
-- **源站**：`203.0.113.10`（nginx + xray + 3x-ui，VLESS+WS+TLS 经 Cloudflare 橙云代理）
-- **日期**：2026-09-30 23:20 ~ 2026-10-01 02:35（北京时间）
-- **组件**：Cloudflare 橙云反代 / xray (3x-ui) / nginx / CloudflareSpeedTest v2.3.5
-- **结论**：已修复。10 个优选 IP 节点全部 RST，根因是链路中间设备按 TLS ClientHello 的 **SNI 字段做字符串匹配**，命中 `cc.cd` 即静默丢弃 SYN。**换任何 IP、换任何服务器、开 TLS 分片，全部无效**；唯一有效解是换域名。
+接下来六个小时，我把"优选 IP"这个圈子里几乎所有的常识都验证成了错的。
 
----
+先把结论放在这儿，省得你往下翻：
 
-## 1. 问题现象
+> **什么都没坏。** IP 是健康的，源站是健康的，Cloudflare 也是健康的。
+> 是链路中间有人读 TLS 握手里的域名做字符串匹配，命中就掐断连接。
+> **换 IP 救不了，换服务器也救不了，唯一的办法是换域名。**
 
-订阅里 10 个优选 IP 节点（`优选IP-CMCC-1..5` / `优选IP-CUCC-1..5`，分属四个公开源）同一时刻全部失效：
+下面的内容按"你可能正需要什么"排列：先给你 30 秒自检，再讲为什么，再给修复清单，最后才是我怎么查出来的。
 
-```bash
-$ curl -v https://cdn.mydomain.example/
-*   Trying 104.21.25.249:443...
-* Connected to cdn.mydomain.example (104.21.25.249) port 443
-*   Recv failure: Connection reset by peer
-* OpenSSL SSL_connect: Connection reset by peer in connection to cdn.mydomain.example:443
-curl: (35) Recv failure: Connection reset by peer
-```
+> 文中的域名和 IP 都按 RFC 2606 / RFC 5737 换成了文档保留段（`.example`、`203.0.113.x`），命令可以直接照抄。出现的 `198.41.x.x`、`104.x.x.x` 是 Cloudflare 的公开 anycast 地址，不是秘密。
 
-- **TCP 连上了**（三次握手完成），**RST 在 TLS 握手完成之前到达**；
-- 同一批 IP 单独测 `speed.cloudflare.com` **正常**（200，3~4 MB/s）；
-- 服务器端 nginx 进程健康、443 正常监听、ufw 放行、访问日志无异常。
+## 30 秒判断你是不是同一个病
 
-> 域名/IP 已按 RFC 2606（`.example`）与 RFC 5737（`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`）脱敏。文中 Cloudflare 地址（`198.41.x.x` / `104.x.x.x` 等）为其官方 anycast 段，公开基础设施，不涉及隐私。
-
----
-
-## 2. 排查过程与关键证据
-
-按「定位故障域 → 单变量对照 → 排除自干扰 → 多采样 → 双向取证」推进。
-
-### 2.1 第 1 步：定位故障域
-
-先把链路写成一行，标出每一跳能否解释「TCP 连上后才来的 RST」：
-
-```
-客户端 → [ ISP 出口 ] → [ CF 边缘 ] → [ 源站 ] → 返回
-```
-
-- 源站：能解释（拒绝连接），但 TCP 已连上且源站日志无记录，**可能性低**；
-- CF 边缘：能解释（TLS 前中断），**可能性高**；
-- ISP 出口 / 中间链路：能解释（静默丢包），**可能性高**。
-
-从**最便宜的嫌疑犯**开始：源站（一个 SSH 距离）。
-
-### 2.2 第 2 步：单变量对照：三个假设依次证伪
-
-每个实验**只变一个变量**（目标 IP / SNI / 目标服务器），其余保持不变。
-
-**实验 A：源站是否故障**（固定 IP，只换路径，绕过 CDN）
+先把几个变量定好，后面所有命令复制过去就能跑：
 
 ```bash
-$ curl --resolve cdn.mydomain.example:443:203.0.113.10 https://cdn.mydomain.example/
-curl: (35) Recv failure: Connection reset by peer
+DOMAIN=cdn.your-domain.com      # 出问题的那个域名
+EDGE_IP=198.41.209.164          # 任意一个 Cloudflare anycast 边缘 IP
 ```
 
-**→ 证伪。** 同一时间从源站本机经 CF 边缘访问同一主机名，返回 `HTTP/1.1 101 Switching Protocols`；nginx 活着，端口开着，日志干净。
-
-**实验 B：CF 是否封禁优选 IP**（固定 IP，只换 SNI）
+然后拿**同一个边缘 IP**，分别打两个域名：
 
 ```bash
-$ curl --resolve speed.cloudflare.com:443:198.41.209.164 \
-    "https://speed.cloudflare.com/__down?bytes=5000000"
-HTTP/1.1 200 OK
+# [诊断] 打一个已知正常的域名，确认这个 IP 本身是活的
+curl -sS -o /dev/null -w "speed.cloudflare.com -> %{http_code}\n" --max-time 8 \
+  --resolve speed.cloudflare.com:443:$EDGE_IP \
+  "https://speed.cloudflare.com/__down?bytes=1000000"
 
-$ curl --resolve proxy.mydomain.example:443:198.41.209.164 \
-    https://proxy.mydomain.example/
-curl: (35) Recv failure: Connection reset by peer
+# [诊断] 打你自己的域名，看它是怎么死的
+curl -sS -o /dev/null -w "$DOMAIN -> %{http_code}\n" --max-time 8 \
+  --resolve $DOMAIN:443:$EDGE_IP \
+  "https://$DOMAIN/"
 ```
 
-**→ 证伪。** 一个 IP、两个主机名、相反结果。IP 存活，CF 未封禁。
+两次结果只有三种组合，对应完全不同的病因：
 
-**实验 C：换服务器是否解决**（固定「换机器」这一个变量）
+| 第 1 条 | 第 2 条 | 现象 | 结论 |
+|---|---|---|---|
+| `200` | `200` | 两边都通 | 节点没问题，去看订阅、配置或客户端 |
+| `200` | `000` | 同一个 IP，换个域名就活了 | **就是这个病**：域名被掐，跟 IP 无关 |
+| `000` | `000` | 两边都不通 | 这个边缘 IP 本身不通，换一个再测 |
+
+注意第二个结果是 `000`，不是 `403`、`404` 之类的 HTTP 码。**`000` 意味着 curl 连 HTTP 状态码都没拿到，连接在 TLS 握手完成之前就死了。** 这个细节很重要，它把"服务器回了你一个错误"和"连接被外部掐断"区分开了。
+
+如果确认是第二种，可以直接跳到 [怎么修](#fix)。
+
+## 先说人话：SNI 是什么，为什么它能被掐
+
+你访问 `https://example.com`，浏览器得先告诉服务器"我要连的是 example.com"。这句话写在 TLS 握手的第一个包（ClientHello）里，字段名就叫 SNI（Server Name Indication）。
+
+它存在的理由很实际：一个 IP 上可能挂着几万个网站，服务器不看到域名就不知道该拿哪张证书出来。
+
+问题在于：**SNI 是明文的。** 加密要等握手谈完才开始，而 SNI 必须在这之前发出去。所以链路上任何一个设备都能看到你要连哪个域名，不需要解密，读字符串就行。
+
+于是拦截变得极其廉价：拿一张域名名单，做子串匹配，命中就对连接动手。这次命中的是 `cc.cd` 这五个字符，就这么简单粗暴。
+
+**这里有个容易搞错的地方**：很多人以为"要读 SNI 就得先看到完整的 TLS 会话"，进而以为拦截发生在 SYN 阶段。实际上读 SNI 只需要 TCP 握手完成、ClientHello 发出来就够了。所以真正发生的不是"丢掉你的 SYN"，而是"放你进来，读到你连的是谁，再把连接杀掉"。这个区别决定了你该往哪个方向查（见 [我是怎么确认的](#evidence)）。
+
+## 三个"看起来很对"的办法，为什么全都没用
+
+如果你已经试过下面这些，别怀疑自己的操作，它们本来就无效：
+
+| 你会想 | 为什么不行 |
+|---|---|
+| 换一个优选 IP | 优选 IP 换的是 IP，域名一个字没变。SNI 里还是那串字符，照样命中 |
+| 换台 VPS / 换服务商 | 同上。我在另一家、另一个地区的机器上测，RST 一模一样。变量从来不在服务器 |
+| 开 TLS 分片（`fragment`） | 分片是把 ClientHello 拆成几个 TCP 段，但中间设备把段拼起来是件很便宜的事。我开着分片测，reset 照来 |
+| 等 Cloudflare"解除封禁" | Cloudflare 什么都没封。同一个 IP 换别的域名访问就是 200 |
+
+一句话：**只要你还在用这个域名，链路中间那道匹配就一直有效。**
+
+有个旁证很能说明问题：同一台服务器、同一批端口上，借用 `www.nvidia.com` 当 SNI 的 REALITY 节点从头到尾没坏过，因为它的 ClientHello 里根本没有可匹配的东西。拦截发生在客户端到边缘这一跳，跟你的服务器没关系。
+
+## 怎么修：换域名，一共 5 处 {#fix}
+
+在"Cloudflare 橙云反代 + VLESS"这套结构里，域名是**每一层都硬编码**的。所以"换个域名"不是改一个地方，是改五处。
+
+**前置条件**：你能改 DNS（Cloudflare 后台）、能 SSH 上源站、能重签源站证书。客户端（软路由 / mihomo / 各种 GUI）也要能改订阅地址。
+
+按下面的顺序改，改完统一验收。
+
+### ① DNS（Cloudflare 后台）
+
+```
+A   new.your-domain.com   →   <你的源站 IP>   proxied = true（橙云打开）
+```
+
+API Token 只需要 **Zone → DNS → Edit** 一项权限，别的都不用给。
+
+### ② 源站证书（把新域名加进去）
+
+证书要重签，新旧域名都放进 SAN，这样旧域名还能用、方便回滚：
+
+```
+DNS:old.your-domain.com, DNS:new.your-domain.com, DNS:*.new.your-domain.com
+```
+
+> **坑 1：证书和私钥是两个文件。** 只换证书不换私钥，握手会报 `sslv3 alert handshake failure`。这个报错长得特别像 Cloudflare 那边出问题，很容易查错方向。**必须成对替换。**
+>
+> **坑 2：Cloudflare 的加密模式要用 `full`，不能用 `strict`。** 自签的源站证书过不了 strict 校验。
+
+### ③ nginx
+
+443 的 server 块里把新域名加进 `server_name`，**旧域名保留**：
+
+```nginx
+server_name old.your-domain.com old-cdn.your-domain.com new.your-domain.com;
+```
+
+### ④ xray / 3x-ui 入站（这次最耗时的一处）
+
+WS 入站里原本硬校验了 `host = 旧域名`，新域名打进来一律 404。
+
+这里是全文最大的坑：**3x-ui 把入站配置存在 SQLite 里，每次重启都从数据库重新生成 `config.json`。你手改 `config.json` 会被静默回滚，而且不报错。**
+
+正确顺序：
+
+1. 改 `/etc/x-ui/x-ui.db` 里 `inbounds` 表的 `stream_settings`，把 `wsSettings.host` 去掉（多域名交给 nginx 按 `$host` 分流）；
+2. 重启面板；
+3. **杀掉还占着 10086 端口的残留 xray 进程**。不杀的话旧进程抱着端口，配置根本不生效。
+
+三步缺一不可，而且前两步失败**都不会有任何报错**。改完没反应，八成就是这里。
+
+### ⑤ 订阅生成器 + 消费端
+
+生成 VLESS 链接时写进 `sni` / `host` 的参数：
 
 ```bash
-$ curl --resolve alt-server.example.org:443:198.51.100.20 https://alt-server.example.org/
-curl: (35) Recv failure: Connection reset by peer
+# cron 必须带上环境变量，否则某次定时任务会把订阅静默覆盖回旧域名
+5 0,6 * * * VLESS_SNI=new.your-domain.com VLESS_HOST=new.your-domain.com /usr/bin/python3 subgen.py
 ```
 
-**→ 证伪。** 不同商家、不同地区的无关机器，同样的 RST。变量从来不在服务器。
+下游（比如软路由上的 mihomo）拉订阅的地址也要换成新域名。
 
-### 2.3 第 3 步：排除自干扰
-
-**（a）本地代理 / 透明重定向是否在吃流量**
+### 改完怎么验
 
 ```bash
-$ env | grep -iE 'http_proxy|https_proxy|all_proxy'
-（空）
-
-$ nft list table inet mihomo | head -5
-table inet mihomo {
-        chain tproxy_prerouting {
-                type filter hook prerouting priority mangle; policy accept;
-                iifname != "eth1" return          # 本机自身流量不进入 tproxy
+# [验收] 真实的 WebSocket 升级，返回 101 才算通
+curl -sk -o /dev/null -w "%{http_code}\n" \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  --resolve new.your-domain.com:443:$EDGE_IP \
+  "https://new.your-domain.com/cfws-<你的路径>"
 ```
 
-**→ 排除。** 无代理环境变量；mihomo 的 tproxy 规则首行即 `iifname != "eth1" return`，只处理 LAN 口转发流量，本机发起的连接不经 mihomo；mihomo 表内无 output 链。
+我改完的实际结果：新旧域名都返回 `101`，订阅拉到 14 个节点全部可用，代理出口实测 0.40s，直连延迟从"全部失败"变成 67~133ms。
 
-**（b）是否存在"不可比的测量值"**
+## 我是怎么确认的 {#evidence}
 
-曾用某测速工具的 236ms 与自测 curl 的 1.27s 直接对比，判定"工具数据不可信"。**该判定错误**：两者相差约 4 分钟、测法不同（工具为 TCPing 多次平均，curl 为单次 `time_connect`），不构成矛盾。
+上面那套结论不是猜的，但这一节的方法可能比结论更值钱。下次遇到"一批东西同时挂掉"，可以照这个顺序走。
 
-> **教训**：一次测量只是一个数据点。结论需要**同方法、近时间、同一对象**的重复测量。
+### 1. 先把"服务器死了"排除掉
 
-### 2.4 第 4 步：多采样，抓到 5 倍离群值
+正常人的第一反应。我直接绕过 CDN 打源站 IP，还是 RST。但源站本身好着呢：同一时间从源站本机经 Cloudflare 边缘访问同一域名，返回 `HTTP/1.1 101 Switching Protocols`，nginx 活着、443 在听、ufw 放行、日志干净。
 
-对同一 IP 连续 5 次采样（`curl -w "%{time_connect}"`）：
+**一个服务是"拒绝了你"还是"根本没收到"，症状完全不同**，这是后面真正破案的关键。
 
-```
-connect=0.234766s
-connect=0.221261s
-connect=1.260345s    ← 第 3 次
-connect=0.232439s
-connect=0.239106s
-```
+### 2. 固定 IP，只换域名（决定性的一步）
 
-**决定性发现**：物理 RTT 230ms 的健康链路，单次实测 1.26s。
+这一步是整个排查的转折点。同一个边缘 IP，只换 ClientHello 里的域名：
 
-**机制**：Linux 内核首次 SYN 重传超时 `TCP_TIMEOUT_INIT` = **1.0 秒**。首个 SYN 发生一次丢包 → 客户端死等 1.0s 才重传 → 重传的 SYN 约 230ms 后收到 SYN-ACK →
-
-```
-time_connect = 1.0s (RTO 等待) + 0.23s (物理 RTT) = 1.26s
-```
-
-**推论（对测速工具同样成立）**：任何「多次握手 + 仅对成功者取平均」的指标，都会把 25% 丢包的节点报成"健康的 230ms"。**均值掩盖最坏情况**，评估节点必须看最坏值与丢包率。
-
-### 2.5 第 5 步：双向取证：tcpdump 决定性证据
-
-客户端只能证明"请求失败"，**证明不了在哪里失败**，且 `Connection reset by peer` 描述的是客户端自己的 socket。必须从另一端取证。
-
-源站执行：
-
-```bash
-sudo timeout 30 tcpdump -ni any \
-  "tcp[tcpflags] & (tcp-syn|tcp-rst) != 0 and tcp dst port 443" -vv -c 20
-```
-
-窗口内客户端发一次请求，捕获到的全部相关包：
-
-```
-14:51:28.175281 ens3 In  IP 198.51.100.77.17652 > 203.0.113.10.443: Flags [S]
-14:51:28.458155 ens3 In  IP 198.51.100.77.17652 > 203.0.113.10.443: Flags [R.]
-```
-
-**逐字段判读**：
-
-| 观察项 | 值 | 含义 |
+| ClientHello 里的 SNI | 结果 | 怎么读 |
 |---|---|---|
-| 第一个包 | `Flags [S]`，来自客户端 | SYN 到达源站 |
-| 第二个包 | `Flags [R.]`，**源地址仍是客户端** | RST 由客户端自己发出 |
-| ack 值 | `486385868` | 源站从未发出过该序列号 |
-| 间隔 | 283 ms | 客户端等待 SYN-ACK 超时 |
-| 源站回包 | **0 个** | 源站从未参与 |
+| `speed.cloudflare.com` | `200 OK` | 没被干预 |
+| `de5.net` / `cwu.cc` / `bbroot.com` / `i.cd` / `us.ci` / `bot.cd` / `kz.ci` | TLS alert | 包到了 Cloudflare，是 Cloudflare 正常拒绝的 |
+| `cc.cd` | **Connection reset** | 被外部掐断 |
 
-**→ 源站没有拒绝任何东西，它压根没被联系上。** SYN 在客户端与源站之间被静默丢弃；客户端超时后自行 RST。此前在同一台服务器上排查防火墙规则约 60 分钟，全部指向错误方向。
+**两种失败模式必须分清：**
 
-```mermaid
-flowchart LR
-    A["客户端发出 SYN"] --> B["SYN-ACK 始终不返回<br/>源站 0 回包"]
-    B --> C["客户端 1s SYN RTO 到期<br/>自行发出 RST"]
-    C --> D["curl 报<br/>Connection reset by peer"]
+- **TLS alert** = Cloudflare 回的包。说明请求到达了边缘并被正常处理，没人干预。
+- **干净 RST** = 握手中途被外部杀死。有干预。
 
-    style A fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style B fill:#3d1f1f,stroke:#a45050,color:#e6e6e6
-    style C fill:#3d1f1f,stroke:#a45050,color:#e6e6e6
-    style D fill:#3d1f1f,stroke:#a45050,color:#e6e6e6
-```
+### 3. 把规则锁定到字符串
 
-> 这张图解释了为什么前 4 步（全部在客户端单侧执行）花了 90 分钟才走到第 5 步：**正在骗我的那台机器，恰好是我唯一在测的机器。**
-
-### 2.6 规则粒度锁定：单变量对照的决定性一击
-
-故障域收窄到"客户端与源站之间、源站未被触达"后，回到实验 B 的设计：**固定 IP，只变 SNI**。
-
-同一 IP（`198.41.209.164`）、同一客户端、同一时刻：
-
-| SNI / Host 送入 ClientHello | 结果 | 判读 |
-|---|---|---|
-| `speed.cloudflare.com` | **200 OK** | 未被干预 |
-| `i.cd` | TLS alert | 包到达 CF，CF 正常拒绝 |
-| `us.ci` | TLS alert | 同上 |
-| `bot.cd` | TLS alert | 同上 |
-| `de5.net` | TLS alert | 同上 |
-| `cwu.cc` | TLS alert | 同上 |
-| `bbroot.com` | TLS alert | 同上 |
-| `kz.ci` / `xyz.ci` / `pc.ci` | TLS alert | 同上 |
-| `cc.cd` | **Connection reset** | **被干预** |
-
-**两种失败模式必须分清**：
-
-- **TLS alert** = Cloudflare 回的包 → 请求到达了边缘并被正常处理 → **无干预**；
-- **干净 RST** = 握手中途被外部杀死 → **有干预**。
-
-进一步两个探测，锁定匹配粒度：
+再补两个探测，就能确定匹配的粒度：
 
 ```bash
-# .cd 但非 cc.cd  →  存活（CF 正常回 TLS alert）
-$ curl --resolve abc123def.cd:443:198.41.209.164 https://abc123def.cd/
+# .cd 但不是 cc.cd  →  存活
+curl --resolve abc123def.cd:443:$EDGE_IP https://abc123def.cd/
 
-# cc.cd 但主机名根本不存在（编造）  →  reset
-$ curl --resolve randxyz.cc.cd:443:198.41.209.164 https://randxyz.cc.cd/
+# cc.cd，但这个域名根本不存在（随手编的）  →  reset
+curl --resolve randxyz.cc.cd:443:$EDGE_IP https://randxyz.cc.cd/
 ```
 
-**→ 命中的是字面字符串 `cc.cd` 本身。** 不是 `.cd` 这个 TLD（C 实验），不是具体主机名（编造域名实验），不是 IP，不是端口。
+结论：**命中的就是 `cc.cd` 这五个字面字符。** 不是 `.cd` 这个后缀，不是我具体的主机名，不是 IP，也不是端口：443、8443，甚至 80 端口纯 HTTP 的 `Host` 头，都会中。
 
-**与端口无关**：443、8443、以及 80 端口纯 HTTP 的 `Host` 头，均命中。
+### 4. 源站抓包：这里我自己犯了个错
 
-**与分片无关**：客户端已配置 `fragment`（`1,40-60,30-50,tlshello`）把 ClientHello 拆段发送，reset 照常到达。中间设备重组与跨段匹配成本极低。
+这个错值得单独说，因为它差点把我带到沟里。
 
-**预测验证（规则正确性的旁证）**：同服务器、同端口的 REALITY 节点（借用 `www.nvidia.com` / `www.sony.com` 作为 SNI）**始终正常**。ClientHello 中无 `cc.cd`，预测成立。
+我最初用的过滤器是：
+
+```bash
+tcpdump -ni any "tcp[tcpflags] & (tcp-syn|tcp-rst) != 0 and tcp dst port 443" -vv -c 20
+```
+
+`tcp dst port 443` 只能看到"发给源站的包"。而**源站的回包是源端口 443、目的端口是客户端的临时端口，永远匹配不上这条规则**。所以我一度得出"源站一个包都没回"，其实是我的过滤器看不见，不是源站没回。
+
+正确的写法：
+
+```bash
+sudo tcpdump -ni any port 443 -vv -c 20
+```
+
+实际抓到的两个包（时间戳相对化）：
+
+```
+[S]   ← 客户端 → 源站的 SYN，正常到达
+[R.]  ← 283ms 后，源地址显示是客户端自己
+```
+
+### 5. 正确的因果链
 
 ```mermaid
 flowchart TD
-    S["症状：全部节点 RST"] --> O["第0步：记录确切报错<br/>TCP已连 + 握手前被RST"]
-    O --> D["第1步：列出链路各域<br/>从最便宜嫌疑犯查起"]
-    D --> V["第2步：单变量对照<br/>一个测试只变一个量"]
-    V --> C{"符合假设？"}
-    C -->|否| E["排除该层<br/>换下一域"]
-    C -->|是| X["第二个对照确认"]
-    E --> V
-    X --> N["第3步：排除自干扰<br/>代理 / 不可比测量"]
-    N --> M["第4步：多次采样<br/>均值掩盖最坏值"]
-    M --> P["第5步：链路两端取证<br/>tcpdump 双向对照"]
-    P --> R["一句话说出根因"]
-
-    style S fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style O fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style D fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style V fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style N fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style M fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style P fill:#1e2430,stroke:#4a5568,color:#e6e6e6
-    style R fill:#1f3d24,stroke:#4a9a5f,color:#e6e6e6
-    style E fill:#232936,stroke:#4a5568,color:#e6e6e6
-    style X fill:#232936,stroke:#4a5568,color:#e6e6e6
+    A["TCP 握手已经完成<br/>客户端拿到了源站的初始序列号"] --> B["客户端发出 ClientHello<br/>SNI = cc.cd"]
+    B --> C["中间设备读到 SNI，命中名单"]
+    C --> D["向连接两端注入伪造 RST"]
+    D --> E["curl 报<br/>Connection reset by peer"]
 ```
 
----
+几个关键点：
 
-## 3. 根因
+- 那个 RST 里带着 `ack = 486385868`。**这个序列号只可能是客户端从源站的 SYN-ACK 里学来的**。换句话说，TCP 握手确实完成了，SYN-ACK 真的回来了。
+- 所以"SYN 被丢弃、源站从未被联系上"这个说法**站不住**。想读到 SNI，前提就是握手已经完成、ClientHello 已经发出。
+- 283ms ≈ 一个 RTT。触发得这么快，不像超时（超时要等满 1 秒，见下面第 6 点）。
+- 那个"来自客户端的 RST"很可能是**中间设备伪造的**。双向注入 RST 是这类设备的标准手法。这一点我没法百分百证实（伪造包的源地址看起来就是客户端本身），但它是唯一能同时解释所有观测的假设。
 
-链路中间设备对 TLS ClientHello 的 **SNI 字段做字符串匹配**，命中 `cc.cd` 后**静默丢弃 SYN**（不发 RST、不回 ICMP），客户端等待 1 秒 SYN RTO 后自行重置连接，表现为 `Connection reset by peer`。
+**诚实的结论：现象确凿，命中 `cc.cd` 就掐断；机制是"读到 SNI 后注入 RST"，不是"丢弃 SYN"。** 如果你的环境能复现，用 `sudo tcpdump -ni any port 443 -vv` 从两端同时抓，就能直接看到 RST 是从哪一侧、什么时候进来的。
 
-```
-客户端 → [ ISP 出口 ] → [ 中间设备: 读 SNI, 匹配 cc.cd, 丢包 ] → [ CF 边缘 ] → [ 源站 ]
-                                                     ↑
-                                            源站从未被触达（tcpdump 0 回包）
-```
+### 6. 顺手踩到的另一个坑（已单独成文）
 
-**优选 IP 机制本身无缺陷**。失效发生在「客户端 → CF 边缘」这一跳，而这一跳被字符串匹配掐断，**任何 IP 都无法绕过**。
+排查过程中我做过 5 次连续采样，第 3 次是 1.26s，其余都是 0.23s 左右，差了 5 倍。
 
-**同时解释了为何 CF 回源段完全正常**：nginx `/cfws-*` 路径累计 38053 次 `101`（WebSocket 升级成功），客户端 IP 段全部为 CF 边缘段。回源从来不是瓶颈，只是**从未被走到**。
+这跟 SNI 没关系，是 Linux 内核的一个固定行为：**首次 SYN 重传超时 `TCP_TIMEOUT_INIT` = 1.0 秒**。首包丢一次，你就得干等满 1 秒。`1.26s = 1.0s 等待 + 0.23s 真实 RTT`，对得上。
 
----
+它坑人的地方在于**均值掩盖最坏值**：任何"多次握手、只对成功的那几次取平均"的测速工具，都会把一个 25% 丢包的节点报成"健康的 230ms"。
 
-## 4. 修复方案
+这一条我拆成了单独一篇：**[单次测量骗了你 5 倍：Linux 的 1 秒 SYN 重传陷阱 →](/zh/2026/10/01/syn-rto-measurement-trap/)**
 
-域名在 CF 橙云反代的 VLESS 节点中**每一层都硬编码**，故"换域名"= 改 5 处。
+## 我踩过的坑
 
-### 4.1 DNS（Cloudflare）
+1. 在源站找防火墙规则，白花了一小时。 症状指向"服务端拒绝了我"（`Connection reset by peer` 听起来就像服务端在拒绝），我就真的去找服务端的拒绝。**这句话在"问题出在哪"上撒了谎。** 打破循环的是停下来想了一件事：10 个同时挂掉的节点，共享什么？它们不共享 IP、商家、端口、配置文件，它们只共享 ClientHello 里那个域名。**当一堆相似的东西同时坏掉，原因通常就是它们共享的那个东西。**
+2. 改了 `config.json` 却毫无反应。 3x-ui 从 SQLite 重新生成，静默回滚。改错文件不会有任何提示。
+3. 只换了证书没换私钥，得到 `sslv3 alert handshake failure`，看起来像 Cloudflare 挂了。
+4. 把两个不可比的测量值直接对比，得出"测速工具不可信"的错误结论。两次测量相隔 4 分钟、方法也不同（多次平均 vs 单次），本来就不该放在一起比。
+5. 只用一次测量下判断。 见上面第 6 点。
 
-```
-A   new.mydomain.example   →   203.0.113.10   proxied=true（橙云）
-```
-
-所需 API Token 权限：**Zone → DNS → Edit**（仅此一项）。
-
-### 4.2 源站证书
-
-原证书 `subject=issuer=CN=old-proxy.mydomain.example`（自签，有效期至 2036）。重签并加入 SAN：
-
-```
-DNS:old-proxy.mydomain.example, DNS:old-cdn.mydomain.example,
-DNS:new.mydomain.example, DNS:*.new.mydomain.example
-```
-
-**CF 加密模式必须为 `full`（非 `strict`）**，自签源站证书无法通过 strict 校验。
-
-> ⚠️ **证书与私钥是两个独立文件**。只替换证书不改私钥 → `sslv3 alert handshake failure`，且该报错外观酷似 Cloudflare 侧故障，极易误判。
-
-### 4.3 nginx
-
-443 server 块增加新主机名：
-
-```nginx
-server_name old-proxy.mydomain.example old-cdn.mydomain.example new.mydomain.example;
-```
-
-### 4.4 xray / 3x-ui 入站（本次最耗时的一处）
-
-WS 入站原先硬校验 `host=old-proxy.mydomain.example`，新主机名一律返回 404。
-
-**3x-ui 将入站配置持久化在 SQLite，每次重启由数据库重新生成 `config.json`**，直接编辑 `config.json` 会被**静默回滚**。正确做法：
-
-1. 改 `/etc/x-ui/x-ui.db` 中 `inbounds.stream_settings`，移除 `wsSettings.host`（多域名场景交由 nginx 按 `$host` 分流）；
-2. 重启面板；
-3. **杀掉仍占用 10086 端口的残留 xray 进程**，否则改动不生效（旧进程持有端口，配置未重载）。
-
-> 三个环节缺一不可：改错位置 → 静默回滚；漏杀残留进程 → 改动不生效。两者都**不产生任何错误提示**。
-
-### 4.5 订阅生成器
-
-生成 VLESS 链接时的 `sni` / `host` 参数，以及**定时重跑订阅的任务**：
+## 附录：命令速查
 
 ```bash
-# cron 必须带环境变量，否则会在某次运行中把订阅覆盖回旧域名，且不报错
-5 0,6 * * * VLESS_SNI=new.mydomain.example VLESS_HOST=new.mydomain.example /usr/bin/python3 subgen.py
+# ---- 变量 ----
+DOMAIN=cdn.your-domain.com
+EDGE_IP=198.41.209.164
+
+# ---- [诊断] 同 IP 换域名，判断是不是被掐 ----
+curl -sS -o /dev/null -w "speed.cloudflare.com -> %{http_code}\n" --max-time 8 \
+  --resolve speed.cloudflare.com:443:$EDGE_IP \
+  "https://speed.cloudflare.com/__down?bytes=1000000"
+curl -sS -o /dev/null -w "$DOMAIN -> %{http_code}\n" --max-time 8 \
+  --resolve $DOMAIN:443:$EDGE_IP "https://$DOMAIN/"
+
+# ---- [诊断] 源站侧抓包（注意不要加 dst port 443）----
+sudo tcpdump -ni any port 443 -vv -c 20
+
+# ---- [验收] WebSocket 升级，要 101 ----
+curl -sk -o /dev/null -w "%{http_code}\n" \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  --resolve new.your-domain.com:443:$EDGE_IP \
+  "https://new.your-domain.com/cfws-<你的路径>"
 ```
 
-### 4.6 客户端侧（下游消费者）
+## 给 AI / 自动化脚本的速查
 
-- 盒子 mihomo 的订阅拉取地址改用新域名，并在拉取时**钉死实测可达的 CF 边缘 IP + 携带 SNI**（DNS 默认解析出的边缘 IP 实测 8s 超时；`http.client` 默认不带 SNI 会触发 handshake failure）；
-- 客户端订阅地址改用新域名。
+如果你是把这篇文章喂给一个 agent 让它复现，下面这段是给它的：
 
----
+```text
+症状判据
+  同一边缘 IP + 不同 SNI：
+    speed.cloudflare.com -> 200 且 你的域名 -> 000(reset)  ⇒ 域名被 SNI 字符串匹配掐断
+  只要出现这一组合，不要再往下查 IP / 服务器 / Cloudflare。
 
-## 5. 验证结果
+必做动作（按顺序）
+  1. 换域名，在 Cloudflare 加一条 proxied=true 的 A 记录
+  2. 重签源站证书，SAN 含新域名；证书与私钥必须成对替换；CF 加密模式 = full
+  3. nginx 443 server_name 追加新域名（保留旧域名，方便回滚）
+  4. 改 /etc/x-ui/x-ui.db 的 inbounds.stream_settings，移除 wsSettings.host；
+     重启面板；杀掉仍占用 10086 端口的残留 xray
+  5. subgen.py 的 VLESS_SNI / VLESS_HOST（cron 也要带环境变量）
+  6. 下游订阅地址改为新域名
 
-### 5.1 节点握手（真实 WebSocket 升级）
+不要做（已验证无效）
+  换优选 IP / 换 VPS / 换商家 / 开 TLS fragment / 等 Cloudflare 解封
+  在源站查防火墙规则
 
-```bash
-# 新域名 · 直连源站
-$ curl -sk -H "Connection: Upgrade" -H "Upgrade: websocket" \
-       -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-       --resolve new.mydomain.example:443:203.0.113.10 \
-       https://new.mydomain.example/cfws-*
-HTTP/1.1 101 Switching Protocols
-
-# 新域名 · 经 CF 边缘
-$ curl ... --resolve new.mydomain.example:443:198.41.209.164 ...
-HTTP/1.1 101 Switching Protocols
-
-# 旧域名 · 回归检查（未被破坏）
-$ curl ... --resolve old-proxy.mydomain.example:443:198.41.209.164 ...
-HTTP/1.1 101 Switching Protocols
+易错点
+  - tcpdump 加 tcp dst port 443 会漏掉源站的回包，会误导出"源站没回包"的错误结论
+  - 3x-ui 手改 config.json 会被静默回滚，真实来源是 SQLite
+  - 证书与私钥不成对 ⇒ sslv3 alert handshake failure
+  - 机制是"读到 ClientHello 的 SNI 后注入 RST"，不是"丢弃 SYN"；
+    能读到 SNI 就说明 TCP 握手已经完成
 ```
-
-### 5.2 客户端拉取与实际代理
-
-```
-订阅拉取      : 200, 3100 字节
-节点总数      : 14（盒子自测 4 + 公共源 10），全部通过 101 握手校验
-代理出口实测  : HTTP/204，t=0.40s
-```
-
-### 5.3 修复前后延迟对比
-
-| 阶段 | 平均 connect | 说明 |
-|---|---|---|
-| 修复前（`cc.cd`） | 全部失败 | SNI 被匹配，握手无法完成 |
-| 修复后（新域名） | 67 ~ 133 ms | 14 节点全部可用 |
-
----
-
-## 6. 部署与运维
-
-### 6.1 文件清单
-
-| 路径 | 说明 |
-|---|---|
-| `/etc/nginx/sites-enabled/9router` | 443 server 块 `server_name` |
-| `/etc/nginx/cf-origin.crt` / `.key` | 源站证书 + 私钥（**必须成对替换**）|
-| `/etc/x-ui/x-ui.db` | 3x-ui 入站配置（**真实来源，非 config.json**）|
-| `/usr/local/x-ui/bin/config.json` | 运行时生成，勿手改 |
-| `subgen.py` | 订阅生成器（`VLESS_SNI` / `VLESS_HOST` 环境变量）|
-| `mihomo/add_cfbest_dl.py` | 盒子侧订阅消费脚本 |
-
-### 6.2 备份
-
-```
-/etc/nginx/cf-origin.crt.bak-<date>      /etc/nginx/cf-origin.key.bak-<date>
-/etc/nginx/sites-enabled/9router.bak-<date>
-/usr/local/x-ui/bin/config.json.bak-<date>
-/etc/x-ui/x-ui.db.bak-<date>
-subgen.py.bak-<date>          sub.txt.bak-<date>
-```
-
-### 6.3 日常操作
-
-```bash
-# 拉取订阅（换域名后必须改这里）
-curl -k https://new.mydomain.example/cfbest
-
-# 节点握手自检
-curl -sk -H "Connection: Upgrade" -H "Upgrade: websocket" \
-     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-     https://new.mydomain.example/cfws-* -o /dev/null -w "%{http_code}\n"
-```
-
----
-
-## 7. 避坑清单（已证伪的旧结论）
-
-| 旧结论 | 实际情况 |
-|---|---|
-| ❌「源站防火墙拦了」 | tcpdump 证明源站 0 回包，从未被触达 |
-| ❌「Cloudflare 封禁了优选 IP」 | 同一 IP 换 SNI 即 200 |
-| ❌「换台 VPS / 换商家就能解决」 | 不同商家不同地区，同样 RST |
-| ❌「开 TLS 分片（fragment）可绕过」 | 已配置，reset 照常；中间设备可重组 |
-| ❌「REALITY 节点也受影响」 | REALITY 借用的 SNI 不含 `cc.cd`，始终正常 |
-| ❌「源站证书报错说明 Cloudflare 有问题」 | 实为证书与私钥未成对替换 |
-| ❌「改 `config.json` 就能改 xray 入站」 | 3x-ui 从 SQLite 重新生成，手改被静默回滚 |
-| ❌「工具报 236ms、curl 测 1.27s，所以工具不可信」 | 两者不同方法、相隔 4 分钟，不可比；真实原因是丢包触发 1s RTO |
-| ⚠️ 「单次测量即可判定节点质量」 | 单次采样会命中 1s RTO 离群值，必须多次采样看最坏情况 |
-
----
-
-## 8. 附录：可复用的最小诊断
-
-```bash
-# 同一 IP、两个 SNI。若第一个 200、第二个 reset，则 IP 无罪、域名有事。
-curl -sS -o /dev/null -w "%{http_code}\n" --max-time 8 \
-  --resolve speed.cloudflare.com:443:198.41.209.164 \
-  "https://speed.cloudflare.com/__down?bytes=5000000"
-
-curl -sS -o /dev/null -w "%{http_code}\n" --max-time 8 \
-  --resolve your.domain.here:443:198.41.209.164 \
-  https://your.domain.here/
-```
-
-```bash
-# 线上确认：RST 源地址为客户端、且源站全程未回包，即为静默丢包特征
-sudo timeout 30 tcpdump -ni any \
-  "tcp[tcpflags] & (tcp-syn|tcp-rst) != 0 and tcp dst port 443" -vv -c 20
-```
-
----
 
 ## 参考
 

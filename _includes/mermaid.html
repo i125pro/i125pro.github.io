@@ -1,30 +1,94 @@
 {%- comment -%}
-Renders ```mermaid code blocks as diagrams. No-op on pages without mermaid.
+把 ```mermaid 代码块渲染成图。没有 mermaid 的页面完全不受影响。
+
+两个必须注意的点：
+
+1. kramdown + rouge 输出的是 <pre><code class="language-mermaid">，而 mermaid
+   的 run() 默认只扫描 .mermaid（源码里写死 querySelector: ".mermaid"）。
+   不做这一步 DOM 转换，图永远不会被渲染 —— 读者只会看到一坨 flowchart 源码。
+   转换时把原文存进 data-src，换主题后要用它重绘。
+
+2. 站点支持亮/暗主题。mermaid 的配色在 initialize 时就被烘进 SVG 属性里了，
+   所以不能只写死一套。这里按 <html data-theme> 选色，并用 MutationObserver
+   在用户切换主题后重绘。
+
 Local copy of mermaid (assets/js/mermaid.min.js) — jsdelivr CDN is unreliable
 for CN readers, and this blog is read mostly from mainland China.
 {%- endcomment -%}
 
 <script src="{{ '/assets/js/mermaid.min.js' | relative_url }}"></script>
 <script>
-  if (window.mermaid) {
-    // ponytail: dark theme overrides so node/edge colors stay readable on this
-    // blog's dark background. Keys are mermaid themeVariables.
-    mermaid.initialize({
-      startOnLoad: true,
-      theme: "dark",
-      securityLevel: "loose",
-      themeVariables: {
-        darkMode: true,
-        background: "#12141a",
-        primaryColor: "#1e2430",
-        primaryTextColor: "#e6e6e6",
-        primaryBorderColor: "#4a5568",
-        lineColor: "#8892a4",
-        secondaryColor: "#232936",
-        tertiaryColor: "#1a1f2b",
-        fontSize: "15px"
-      },
-      flowchart: { curve: "basis", htmlLabels: true }
-    });
+(function () {
+  if (!window.mermaid) return;
+
+  // 1) 把 rouge 输出的代码块换成 mermaid 认识的结构，原文留在 data-src 里
+  var nodes = [];
+  document.querySelectorAll('code.language-mermaid').forEach(function (code) {
+    var div = document.createElement('div');
+    div.className = 'mermaid';
+    div.setAttribute('data-src', code.textContent);
+    div.textContent = code.textContent;
+    var pre = code.closest('pre');
+    (pre || code).replaceWith(div);
+    nodes.push(div);
+  });
+  if (!nodes.length) return;
+
+  // 2) 两套配色，取自 _sass/_tokens.scss（这里用实色，避免 token 里的 alpha 让边线发虚）
+  var palettes = {
+    dark: {
+      background: '#161d27',
+      primaryColor: '#232b36',
+      primaryTextColor: '#ebe7e4',
+      primaryBorderColor: '#495059',
+      lineColor: '#8892a4',
+      secondaryColor: '#1c2431',
+      tertiaryColor: '#161d27'
+    },
+    light: {
+      background: '#ebe7e4',
+      primaryColor: '#f7f5f3',
+      primaryTextColor: '#252f3d',
+      primaryBorderColor: '#b9b3ac',
+      lineColor: '#7b8798',
+      secondaryColor: '#e3dfda',
+      tertiaryColor: '#ebe7e4'
+    }
+  };
+
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
   }
+
+  function render() {
+    var vars = palettes[currentTheme()];
+    vars.fontSize = '15px';
+
+    nodes.forEach(function (n) {
+      n.removeAttribute('data-processed');
+      n.textContent = n.getAttribute('data-src');
+    });
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      securityLevel: 'loose',
+      themeVariables: vars,
+      flowchart: { curve: 'basis', htmlLabels: true }
+    });
+
+    mermaid.run({ nodes: nodes });
+  }
+
+  render();
+
+  // 3) theme.js 改的是 <html data-theme>，跟着它重绘
+  var last = currentTheme();
+  new MutationObserver(function () {
+    var now = currentTheme();
+    if (now === last) return;
+    last = now;
+    render();
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
 </script>
