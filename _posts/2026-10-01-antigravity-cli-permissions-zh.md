@@ -174,4 +174,4 @@ CLI settings initialized: permissions=&{Allow:[command(*)] Deny:[command(rm)] As
 
 - [Antigravity CLI 官方文档](https://antigravity.google/docs/cli/reference)——权威的配置参考，可以对照看看它和二进制里嵌的 AI 指引在哪里出现了分歧
 - [Antigravity GitHub 仓库](https://github.com/GoogleCloudPlatform/antigravity)
-- [我写的另一篇：如何在 wire 上实测定位另一次故障](https://i125pro.github.io/zh/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/)——同一个方法论、同一个结论：报错信息指错了嫌疑人，只有单变量对照实验才能找到真的那个
+- [我的另一篇：一次把报错信息当成线索去查、结果查到一台从没收到包的服务器的排查记录](https://i125pro.github.io/zh/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/)——同一套方法、同一个结论：`Connection reset by peer` 指向了服务端拒绝，真正的原因在服务端下游；只有每次只动一个变量的对照实验才能找到它，那篇文章末尾附了完整的「已证伪的旧结论」清单
