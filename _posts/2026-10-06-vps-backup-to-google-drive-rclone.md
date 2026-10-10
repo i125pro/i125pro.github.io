@@ -1,63 +1,42 @@
 ---
-title: "Backing Up Linux Servers to Google Drive with rclone: A Complete Reproducible Walkthrough"
+title: "Daily VPS Backups to Google Drive with rclone"
 lang: en
 permalink: /en/2026/10/06/vps-backup-to-google-drive-rclone/
-description: "A complete, reproducible walkthrough of backing up a VPS and a home server to Google Drive with rclone: creating your own client_id, headless authorization, incremental sync, cron scheduling and failure alerts. Includes two traps I actually hit, with root-cause analysis of a token refresh bug I initially misattributed."
+description: "Step-by-step setup for daily incremental backups of a VPS and a home server to Google Drive with rclone, from creating your own client_id to cron scheduling and Telegram alerts. Plus two traps: a hand-written token that starts failing with 401 after an hour, and nginx sites-enabled files that aren't symlinks."
 keywords: ["rclone backup", "Google Drive backup", "VPS backup", "rclone authorize", "rclone headless", "rclone 401", "Google Drive API", "nginx sites-enabled", "linux backup script", "crontab incremental backup", "rclone own client_id"]
 mermaid: true
 ---
 
-# Backing Up Linux Servers to Google Drive with rclone
+I wanted two Linux machines backed up to Google Drive: a small 4.9G VPS (running x-ui, cloudflare_temp_email and memory-tree) and my main machine at home (running two dozen Docker containers). I ended up with rclone doing an incremental backup every morning and sending a Telegram message if it fails. The setup isn't hard. The one thing that matters most: generate the token with `rclone authorize` instead of building it yourself, or you'll start getting 401 errors after an hour. Steps below are in the order you run them, and every command can be copied as is.
 
-I wanted two Linux machines backed up to Google Drive: a 4.9G VPS running x-ui, cloudflare_temp_email and memory-tree, and a home server running two dozen Docker containers.
+## What you need
 
-rclone's documentation covers the configuration well, so the setup itself isn't hard. This walkthrough gives every step in **the order you actually execute them**, from creating a client_id to the cron job, with each piece copy-pasteable.
+A Google account, a computer with a browser (for clicking through authorization), and SSH access to the VPS.
 
-The last section covers the two places I actually got stuck, with root-cause analysis — including a token refresh bug I initially misattributed to Google.
+## Step 1: Create your own client_id
 
-**Prerequisites**
-
-```
-1. A Google account
-2. A machine with a browser (your laptop is fine, used for OAuth authorization)
-3. SSH access to the machine you're backing up
-```
-
----
-
-## 0. Create your own client_id (do this first, it's the slowest step in the console)
-
-This is mandatory in 2026. From rclone's official docs:
+The client_id is the "app ID card" rclone shows when it accesses your Drive. rclone's built-in shared client_id is being shut down this year. From the [official docs](https://rclone.org/drive/):
 
 > The shared client_id is being retired and will stop working during 2026, so creating your own is now strongly recommended.
 
-(I confirmed that sentence appears in three places on [rclone.org/drive/](https://rclone.org/drive/), including the `--drive-client-id` flag description.)
+1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create a project.
+2. **APIs and Services → Library**, search for `Google Drive API`, click **Enable**. This is the easiest step to miss; skip it and you get `Error 403: googleapi: Error 403: ... SERVICE_DISABLED`.
+3. **OAuth consent screen** (the confirmation page you see when authorizing): choose External, fill in the app name and the two email fields.
+4. **Credentials → Create Credentials → OAuth client ID**, Application type **Desktop app**.
+5. Note down the `client_id` and `client_secret`.
 
-**The steps:**
+For personal use (fewer than 100 users) you don't need Google's verification review. Leave the app in Testing; when the consent page says "Google hasn't verified this app", click **Advanced → Continue**. The only effect of Testing is that the token may have a time limit: mine came with `refresh_token_expires_in: 604799`, which is 7 days. Publishing the app to Production removes that field.
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → create a project
-2. **APIs and Services → Library** → search `Google Drive API` → **Enable**
-   - This is the easiest one to miss. Skip it and every API call fails with `Error 403: googleapi: Error 403: ... SERVICE_DISABLED`
-3. **OAuth consent screen** → External → app name, support email, developer email
-4. **Credentials → Create Credentials → OAuth client ID** → Application type: **Desktop app**
-5. Record the `client_id` and `client_secret`
+## Step 2: Get the token on your local machine
 
-**On verification**: personal use (under 100 users) **does not require passing Google's verification review**. The app can stay in Testing state. Authorization works fine — you just get a "Google hasn't verified this app" banner at the top of the consent screen, which you dismiss with **Advanced → Continue**.
-
-The one real consequence of staying in Testing: the `refresh_token` may carry an expiry field. Mine had `refresh_token_expires_in: 604799` (7 days). Publishing to Production removes that field and makes the token permanent. That's your call.
-
----
-
-## 1. Get the token (the standard way on a headless server)
-
-A server has no browser, so this step uses rclone's `authorize` command — **run it on your local machine with a browser**, not on the server.
+After OAuth authorization Google gives you two things: an `access_token`, which is a temporary ticket that expires in an hour, and a `refresh_token`, which is like a membership card you can trade for a new ticket any time. rclone does the trading itself. The server has no browser, so you authorize on your local machine:
 
 ```bash
 # On your local machine (not the server)
 rclone authorize "drive" "<client_id>" "<client_secret>"
 ```
 
-The command prints a URL; open it in a browser, complete authorization, and the terminal prints a JSON blob:
+Open the link it prints, approve, and the terminal prints a JSON blob:
 
 ```json
 {
@@ -69,13 +48,9 @@ The command prints a URL; open it in a browser, complete authorization, and the 
 }
 ```
 
-**Keep this whole JSON** — the next step needs it.
+Save the whole thing. Note the `expiry` field; Trap 1 explains why it matters.
 
-> ⚠️ If you hand-roll a curl call to Google's token endpoint from the server (because you can't run `rclone authorize` there), you have to handle this contract yourself. That path has a trap — see [section 6](#61-hand-injected-tokens-cannot-refresh).
-
----
-
-## 2. rclone config on the server
+## Step 3: Configure rclone on the server
 
 ```bash
 mkdir -p ~/.config/rclone && chmod 700 ~/.config/rclone
@@ -83,7 +58,7 @@ rclone config      # n for new → name: gdrive → type: drive → paste the JS
 chmod 600 ~/.config/rclone/rclone.conf
 ```
 
-Or write the config by hand (the equivalent of what `rclone config` produces):
+Or write the config file by hand:
 
 ```ini
 [gdrive]
@@ -91,29 +66,21 @@ type = drive
 scope = drive
 client_id = <your client_id>.apps.googleusercontent.com
 client_secret = <your client_secret>
-token = <the whole JSON from step 1>
+token = <the whole JSON from step 2>
 team_drive =
 config_is_local = false
 ```
 
-**Permissions must be 600** — the file holds a refresh_token that can read and write your entire Drive.
-
-**On scope**: use `drive` (full) for personal backups. `drive.file` only reaches files the app created itself, which restricts rclone's ability to list directories and diff existing files.
-
-**Verify**:
+Permissions must be 600: the refresh_token inside can read and write your entire Drive. For scope (how much access the app gets) use `drive`. `drive.file` only sees files the app created itself, which limits rclone when it lists folders and compares files. To verify:
 
 ```bash
 rclone lsd gdrive:
 rclone about gdrive:      # remaining space and usage
 ```
 
----
+## Step 4: Back up the VPS without staging it on disk
 
-## 3. Backing up a remote VPS (without staging it locally)
-
-rclone supports `:sftp,host=...` connection strings, so it reads over SSH and writes straight to the cloud with no local staging — which mattered when the VPS only had 743M free.
-
-Prerequisite: SSH key-based auth already set up on the VPS, and the sshd SFTP subsystem enabled (default).
+rclone can read from the VPS over SFTP (file transfer over SSH) and upload as it reads, with nothing written to disk in between. My VPS had only 743M free, so this mattered. You need SSH key login set up first (SFTP is on by default).
 
 ```bash
 #!/usr/bin/env bash
@@ -144,13 +111,11 @@ rclone copy "$SRC/" "$DEST" "${EXCL[@]}" \
   --stats 30s --stats-one-line
 ```
 
-The exclusion logic: virtual filesystems (unreadable), temp files, logs and package caches (rebuildable), and `node_modules` / `.npm` / `.cache` (an `npm install` brings those back). On the VPS those three categories totalled about 165M.
+`flock` is a file lock: if the last run hasn't finished, the new one skips. The excludes are virtual system directories that can't be read anyway, temp files, logs and package caches that can be rebuilt, and `node_modules`, `.npm` and `.cache` (an `npm install` brings them back). Those last three came to about 165M on my VPS.
 
----
+## Step 5: Back up the local machine, only what you'd have to redo
 
-## 4. Incremental local backup (only what's expensive to recreate)
-
-My local machine had 56G in use. The rule I settled on: **back up only what you'd have to rebuild or reconfigure by hand if it vanished.**
+The local machine had 56G in use. I only back up what I'd have to recreate or reconfigure by hand if it disappeared:
 
 ```bash
 SOURCES=(
@@ -176,13 +141,11 @@ for s in "${SOURCES[@]}"; do
 done
 ```
 
-Excluding `overlay2` and `venv` took the local backup from 24G down to 12.8G.
+Excluding `overlay2` and `venv` brought it from 24G down to 12.8G. Never exclude `/var/lib/docker/volumes`: that's where the containers' databases and credentials live.
 
-`/var/lib/docker/volumes` is the one entry you must not exclude — the databases and credentials in there genuinely have to be recreated by hand. Image layers under `overlay2` come back with a `docker pull`.
+## Step 6: Run it daily and alert on failure
 
----
-
-## 5. Scheduling and failure alerts
+Save the two scripts as `~/bin/vps-gdrive-backup.sh` and `~/bin/local-gdrive-backup.sh`, then write a wrapper:
 
 ```bash
 #!/usr/bin/env bash
@@ -213,27 +176,19 @@ VPS $(rclone size gdrive:backup/vps | tail -1)
 local $(rclone size gdrive:backup/local | tail -1)"
 ```
 
-crontab:
+crontab, daily at 05:30:
 
 ```bash
 30 5 * * * /home/<user>/bin/daily-gdrive-backup.sh >>/tmp/daily-backup.log 2>&1
 ```
 
-**On frequency**: `rclone copy` uses file size and mtime to decide what needs uploading. Walking 140,000 directory entries takes a while, but only changed files actually transfer, typically tens of megabytes. A daily run costs much less than intuition suggests.
+- A daily run is cheap. `rclone copy` uses file size and modification time to find changes. Scanning 140,000 directory entries takes ten-odd minutes, but only tens of MB actually upload.
+- Lots of small files is slow. Drive limits requests per second, and 100,000 files means 100,000 requests. I watched throughput climb from `130 KiB/s` to `1.28 MiB/s`; the bottleneck is Drive, not your bandwidth.
+- Daily increments won't hit the quota. If the first full upload does, rclone reports a quota error rather than silently skipping files, and the next day's run picks up where it left off.
 
-**On speed**: Drive rate-limits API calls for many small files. I measured throughput climbing from `130 KiB/s` to `1.28 MiB/s` — that's Drive's QPS ceiling, not your bandwidth (a hundred thousand files means a hundred thousand requests). So "scanning takes a long time" and "only a few MB actually transferred" can both be true.
+## Trap 1: A hand-built token starts failing with 401 after an hour
 
-**On quota**: the upload allowance varies by account type and isn't a single small fixed number. Daily increments of tens of MB aren't a concern. The 18G first run does exceed a typical personal account's daily allowance, so spread it over a couple of days (rclone reports a quota error rather than silently truncating).
-
----
-
-## 6. The two places I actually got stuck
-
-If you follow steps 0–5 you won't hit either of these. But I did, so here's what happened.
-
-### 6.1 Hand-injected tokens cannot refresh
-
-**Symptom**
+At first I didn't use `rclone authorize`, and exactly one hour into an upload this started:
 
 ```bash
 $ rclone copy ./data gdrive:backup/
@@ -243,24 +198,14 @@ $ rclone copy ./data gdrive:backup/
   googleapi: Error 401: Request had invalid authentication credentials.
 ```
 
-**Why it happened**
-
-I couldn't run `rclone authorize` on the headless server, so I used curl and Python to call Google's token endpoint myself, then wrote the raw JSON response straight into `rclone.conf`.
-
-The problem is the **contract** between two pieces of code:
-
-OAuth 2.0 ([RFC 6749 §5.1](https://datatracker.ietf.org/doc/html/rfc6749#section-5.1)) specifies that token responses express lifetime as `expires_in` (relative seconds) and contain **no absolute timestamp**. Google follows this exactly.
-
-rclone uses Go's `oauth2` package, which computes the absolute time itself:
+I had called Google's token endpoint myself with curl and Python and written the raw JSON response straight into `rclone.conf`. That JSON has no `expiry`: under the OAuth 2.0 spec ([RFC 6749 §5.1](https://datatracker.ietf.org/doc/html/rfc6749#section-5.1)) lifetime is given as `expires_in` (seconds remaining), not as a point in time. The Go `oauth2` package rclone uses does the conversion when it receives a token:
 
 ```go
 // golang.org/x/oauth2/internal/token.go
 Expiry: time.Now().Add(time.Duration(expiresIn) * time.Second)
 ```
 
-So **the JSON produced by `rclone authorize` does contain an `expiry` field** — rclone computed it before writing the file. The raw JSON I injected by hand didn't have it, so rclone read a zero value `time.Time{}`.
-
-rclone's expiry decision (`lib/oauthutil/oauthutil.go`):
+So the output of `rclone authorize` has `expiry`, mine didn't, and rclone read an empty value. Here's the code that decides when to refresh (`lib/oauthutil/oauthutil.go`):
 
 ```go
 func (ts *TokenSource) timeToExpiry() time.Duration {
@@ -275,13 +220,9 @@ func (ts *TokenSource) timeToExpiry() time.Duration {
 }
 ```
 
-Zero value → returns 95 years → the refresh timer is set for 95 years → **it never refreshes**. rclone keeps using an `access_token` that stopped working an hour after it was minted.
+An empty value is treated as expiring in 95 years, so it never refreshes and keeps pushing an expired ticket. I caused this by going around the normal flow; the fix is to get a new token with `rclone authorize`.
 
-The `// ~95 years` comment in the source is rclone's own plain-text way of saying "treat this as never expiring."
-
-**So this is neither Google's bug nor rclone's — it's what happens when you inject data through a non-standard path.** The correct approach is `rclone authorize` from step 1.
-
-**How to confirm it** (run this first on any similar 401):
+Next time you see a similar 401, bypass rclone and check directly whether the membership card can still be traded for a ticket:
 
 ```bash
 # bypass rclone, ask Google directly whether the refresh_token still works
@@ -297,17 +238,13 @@ curl -s https://oauth2.googleapis.com/token \
   -d refresh_token="$RT"
 ```
 
-A fresh `access_token` in the response means the refresh_token is fine and the problem is client-side expiry handling.
+If you get a new `access_token`, the refresh_token is fine and the problem is rclone's expiry check.
 
-**A note on the hack I used as a stopgap**: I set `expiry` to `2020-01-01T00:00:00Z` and `access_token` to the string `"stale"` to force the refresh path. It works, but **don't use it in production** — it's a patch for improperly injected data. The right fix is to re-run `rclone authorize`. (One detail: `access_token` can't be left empty; an empty value makes rclone report `token expired and there's no refresh token`, because it sees an empty access_token and treats the whole token structure as invalid.)
+My stopgap at the time was to set `expiry` to `2020-01-01T00:00:00Z` and `access_token` to `"stale"` to force a refresh. It works, but don't leave it that way. Don't leave `access_token` empty either, or rclone reports `token expired and there's no refresh token`.
 
-### 6.2 nginx `sites-enabled` isn't necessarily a symlink
+## Trap 2: Files in nginx sites-enabled aren't always symlinks
 
-Unrelated to backups, but this one turned "Google's brand review won't pass" into six extra hours — worth writing down because it's easy to miss.
-
-**Symptom**: the review reported "your home page is behind a login page", "app name doesn't match", and "privacy policy lacks sufficient content", while my curl showed 200, a correct `<h1>`, and enough text. Every reported error contradicted the measured state.
-
-The investigation found the bare path returning 502:
+This has nothing to do with backups, but it cost me six extra hours while getting through Google's brand review. The review kept saying "home page is behind a login page", "app name doesn't match" and "privacy policy lacks sufficient content", yet curl showed 200, the right title and plenty of text. Eventually I found the path without a trailing slash returned 502:
 
 ```bash
 for u in "https://example.com/oauth/" "https://example.com/oauth"; do
@@ -320,9 +257,7 @@ https://example.com/oauth/    code=200
 https://example.com/oauth     code=502    <- here
 ```
 
-`location /oauth/` only matches the trailing-slash form, so the bare path fell through to `location /`. Adding `location = /oauth` fixed it.
-
-**But that wasn't the whole story.** Checking the loaded config:
+`location /oauth/` only matches the address with a slash, so `/oauth` fell through to `location /`. Adding `location = /oauth` fixed it. But my edits kept not taking effect, so I checked with `nginx -T` (prints every config file nginx actually loaded):
 
 ```bash
 $ sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
@@ -331,22 +266,18 @@ $ sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
 # configuration file /etc/nginx/sites-enabled/mysite.bak-20260930:  <- also loaded
 ```
 
-Two findings:
-
-**First**: `include /etc/nginx/sites-enabled/*;` uses glob expansion (nginx's docs describe include as accepting a `mask`), so every non-hidden file in the directory loads — including `.bak`. Old config and backups were active simultaneously.
-
-**Second**, and the part that actually cost me the time:
+First problem: the `*` in `include /etc/nginx/sites-enabled/*;` loads every non-hidden file in the directory, `.bak` files included, so old and new configs were live at the same time. The second problem is what actually ate the time:
 
 ```bash
 $ ls -la /etc/nginx/sites-enabled/mysite
 -rw-r--r-- 1 root root 13047 /etc/nginx/sites-enabled/mysite
 ```
 
-**It is not a symlink** — it's an ordinary file. And I had been editing `/etc/nginx/sites-available/mysite`. They're independent copies; changing one has no effect on the other. `nginx -t` passed every time and `systemctl reload nginx` succeeded every time, **on a file that wasn't being served at all.**
+It's a regular file, not a symlink (a symlink is like a shortcut: editing the original edits it too). I had been editing `/etc/nginx/sites-available/mysite`. They were two independent copies, so `nginx -t` and `systemctl reload nginx` succeeded every time while I was editing the file nginx wasn't using.
 
-Worth noting: the `sites-available` / `sites-enabled` split is a **Debian / Ubuntu packaging convention**. Upstream nginx only ships `conf.d/*.conf`. The two directory names are bound by convention, not by the filesystem — a `cp` where an `ln -s` belonged silently breaks that binding.
+Keeping configs in `sites-available` and links in `sites-enabled` is just a Debian / Ubuntu packaging convention; upstream nginx only has `conf.d/*.conf`. Whenever someone used `cp` instead of `ln -s`, the link quietly broke.
 
-**The correct fix** (my blog's first draft suggested switching to `include sites-available/*.conf`, which is wrong — that would load every draft config):
+The fix (don't switch to `include sites-available/*.conf`, which would load every draft):
 
 ```bash
 # 1. find files that aren't symlinks
@@ -355,20 +286,18 @@ find /etc/nginx/sites-enabled/ -maxdepth 1 -type f ! -type l -print
 # 2. tighten the include glob to *.conf
 #    include /etc/nginx/sites-enabled/*.conf;
 
-# 3. clean up .bak files
+# 3. list non-.conf files (like .bak), then clean them up
 find /etc/nginx/sites-enabled/ -type f ! -name '*.conf' -print
 ```
 
-**Lesson: confirm which file is live before editing nginx.**
+Once the glob is tightened, the config you actually want also has to end in `.conf` to load; while you're at it, make it a symlink to the file in `sites-available`. Before editing nginx in future, check which file is live:
 
 ```bash
 sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
 ls -la /etc/nginx/sites-enabled/
 ```
 
----
-
-## 7. Where it ended up
+## Where it ended up
 
 ```
 VPS   gdrive:backup/vps      5.94 GB   110,728 files
@@ -376,9 +305,4 @@ home  gdrive:backup/local   12.87 GB   137,221 files
 cron  05:30 daily, with token preflight and failure alerts
 ```
 
-Roughly eight hours for the initial run (18G, 130k files), tens of MB per day after that.
-
-Both traps in one line each:
-
-1. **Don't hand-inject Google's raw token JSON into `rclone.conf`** — use `rclone authorize`, which converts `expires_in` into `expiry` for you. Skip that and rclone's `timeToExpiry()` treats the zero value as "95 years", so it never refreshes and starts returning 401 after an hour.
-2. **Run `nginx -T` before editing** — files in `sites-enabled` may not be symlinks, and `include *` loads `.bak` files too.
+The first full run took about 8 hours (18G, 130k files); after that it's tens of MB a day.

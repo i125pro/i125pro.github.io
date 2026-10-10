@@ -1,13 +1,15 @@
 ---
-title: "One Sample Lied by 5x: The Linux 1-Second SYN Retransmission Trap"
+title: "An Extra Second in Your Latency Test? Blame Linux SYN Retransmission"
 lang: en
 permalink: /en/:year/:month/:day/:title/
-description: "Five samples of the same IP: one read 1.26s, the other four sat at 0.23s. The IP was fine. The network was fine. A hardcoded 1-second constant in the Linux kernel was poisoning the measurement. Includes a paste-ready sampling loop and a way to estimate packet loss from outliers."
+description: "Five connection tests to the same IP: four at 0.23s, one at 1.26s. The extra second comes from a fixed SYN retransmission wait in the Linux kernel. This post explains why and shows how to measure with repeated samples, the worst case, and an estimated loss rate."
 keywords: ["time_connect varies", "TCP_TIMEOUT_INIT", "SYN retransmission timeout", "benchmark unreliable", "packet loss", "RTT measurement", "Linux TCP RTO", "curl time_connect"]
 mermaid: true
 ---
 
-Five consecutive samples of the same IP:
+I measured connection time to the same IP five times in a row. Four results were 0.23 seconds and one was 1.26 seconds. Nothing was wrong with the IP or the network: the first handshake packet got lost, and the kernel waited a full second, as the rules say it should, before resending it. So don't test a node once, and don't trust the average. Test several times and look at the worst case and the loss rate.
+
+## What I saw
 
 ```
 connect=0.234766s
@@ -17,26 +19,20 @@ connect=0.232439s
 connect=0.239106s
 ```
 
-Four readings at 0.23s, one at 1.26s.
+The RTT on this path (round-trip time: how long a packet takes to get there and for the reply to come back) is 230ms, and `1.26 = 1.00 + 0.23`. That isn't random noise. It's a number you can work out.
 
-**The IP was fine. The network was fine. The measurement was wrong.**
+## Where the extra second comes from
 
-And that 1.26 isn't random noise, it's a number you can compute exactly. The path's physical RTT is 230ms, and `1.26 = 1.00 + 0.23`. The extra second is a constant hardcoded in the Linux kernel.
+To open a TCP connection, the client first sends a SYN packet, like knocking on a door to say "I want to connect". The server replies with a SYN-ACK, like opening the door. If the SYN is lost on the way, the client hears nothing and has to wait a bit before knocking again. That wait is called the RTO (retransmission timeout).
 
-## Where the second comes from
-
-Opening a TCP connection means sending a SYN. If that SYN is lost in transit, the client has to wait before retransmitting, that wait is the RTO (Retransmission Timeout).
-
-In the Linux kernel, the RTO for the first SYN isn't measured, it's a fixed initial value:
+On the first knock the client has no idea how far away the server is, so Linux doesn't measure anything. It just uses a fixed value:
 
 ```c
 /* include/net/tcp.h */
 #define TCP_TIMEOUT_INIT ((unsigned)(1*HZ))   /* 1 second */
 ```
 
-RFC 6298 says the same thing: the initial RTO is 1 second.
-
-So a single lost packet plays out like this:
+RFC 6298 also sets the initial RTO at 1 second. So:
 
 ```mermaid
 flowchart TD
@@ -46,40 +42,27 @@ flowchart TD
     D --> E["Retransmit, then another RTT<br/>time_connect ≈ 1.0 + 0.23 = 1.23s"]
 ```
 
-**Losing one packet doesn't cost a little extra time. It costs a full second.** It's a step, not a slope.
+Losing one packet doesn't make things a bit slower. It adds a whole second. When a web page occasionally freezes for a second before loading, or SSH sometimes hangs while connecting, this is usually why.
 
-That also explains two everyday annoyances:
+## Why the average misleads you
 
-- Why a page sometimes hangs for a second before anything happens, the first packet was lost.
-- Why SSH occasionally stalls at the connecting stage, same cause.
+That one-second outlier skews the numbers, and it can push them either way.
 
-Anywhere a *new* connection's first packet is involved, a delay in the 1-second range is almost always this.
-
-## Why this is worse than "the measurement was slow"
-
-One slow reading is harmless on its own. The problem is that the outlier poisons the statistics, and it does so in **two opposite directions**.
-
-**Direction one: averaging → inflated.**
-
-One 1.26s sample among five:
+Averaging makes things look worse than they are. Put one 1.26-second sample among five:
 
 ```
 (0.23 × 4 + 1.26) / 5 = 2.18 / 5 ≈ 0.44s
 ```
 
-True RTT is 0.23s; the mean reports 0.44s, nearly double. You conclude the node is degrading, when in fact it just drops a packet now and then.
+The real RTT is 0.23 seconds, but the average says 0.44, almost double. It looks as if the node is getting worse.
 
-**Direction two: taking the minimum, or discarding slow samples → falsely healthy.**
+Keeping only the fastest result, or throwing out slow samples as anomalies, makes things look healthier than they are. A node that loses 25% of first packets gets reported as a clean 230ms, because the problem is exactly what got filtered out.
 
-Invert it: if a tool keeps only the fastest sample, or throws away anything past a threshold, a node with 25% first-packet loss gets reported as a flawless 230ms. **The pretty number you're looking at is precisely the evidence, filtered out.**
+So to judge a node, look at the worst case and the loss rate, not the average.
 
-Both failure modes are real and both are common. So:
+## How to measure
 
-> **Don't judge a node by its average. Look at the worst case and the loss rate.**
-
-## How to measure properly
-
-Sample repeatedly, then sort, the worst case becomes impossible to miss:
+Run ten tests and sort them from smallest to largest:
 
 ```bash
 DOMAIN=your.domain.com
@@ -89,38 +72,31 @@ for i in $(seq 10); do
 done | sort -n
 ```
 
-Three things to read out of those ten lines:
+`time_connect` is curl's measure of how long it took from the start until the TCP connection was up. Here's how to read the output:
 
-| What to look at | How to read it |
-|---|---|
-| **First line (minimum)** | The path's true RTT, what "everything normal" looks like |
-| **Last line (maximum)** | Your worst case. This is what users actually feel |
-| **How many lines exceed 1.0s** | Each one is a lost first packet |
+1. The first line is the minimum: the path's real RTT when nothing goes wrong.
+2. The last line is the maximum: the worst a user will run into.
+3. Count the lines above 1.0 second. Each one is a lost first packet. Two out of ten means roughly 20% first-packet loss.
 
-**You can also estimate the loss rate**: 2 out of 10 samples above 1.0s means roughly 20% first-packet loss. That number says more about whether a node is usable than any "average latency".
+In my opening data, one of five samples was over a second, about 20%, which matched how that path actually behaved. The 1.26-second reading was the only sample telling the truth.
 
-Back to the opening data: one outlier in five samples implies about 20% loss, which matches how that path actually behaved. **So the 1.26s reading wasn't an anomaly. It was the only sample telling the truth.**
+## Can you tune it?
 
-## Can it be tuned?
+The one second is a kernel constant, and no ready-made sysctl setting changes it. What you can change is the number of retries, meaning how many attempts are made before giving up:
 
-Only partially. Knowing the limits saves you some wasted effort:
+```bash
+sysctl net.ipv4.tcp_syn_retries      # default 6
+```
 
-- **The 1 second can't be changed.** It comes from a kernel constant; user space cannot alter the initial value.
-- **What you can change is the retransmission count**, i.e. how long it takes to give up entirely:
-  ```bash
-  sysctl net.ipv4.tcp_syn_retries      # default 6
-  ```
-  This only affects how long a total failure takes. It does not affect the 1 second before the first retransmission.
-- **So the real fix is not kernel tuning**, it's not losing the first packet in the first place:
-  - Use a path with less loss (different IP, different route, different ISP);
-  - Or stop opening a new connection every time, keep-alive, HTTP/2 multiplexing, connection pools;
-  - For latency-critical work, UDP-based protocols with their own retransmission logic don't have to wait that second.
+That only changes how long a failed connection takes to give up. It doesn't touch the one second before the first retry. What actually helps is not losing the first packet, or opening fewer new connections:
 
-## In one line
+- Use a path with less loss (a different IP, route, or ISP).
+- Reuse connections you already have: HTTP keep-alive (several requests over one connection), HTTP/2 multiplexing, or connection pools, so you don't repeat the handshake every time.
+- For latency-sensitive work, use a UDP-based protocol that manages its own retransmission, so you never wait for that second.
 
-> A single sample means nothing. **An outlier in the 1-second range is SYN retransmission timeout, not a slow server.**
+## How I ran into this
 
-For what it's worth, I walked into this while debugging [a completely different problem]({{ '/en/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/' | relative_url }}), and nearly concluded the benchmarking tool was unreliable because it reported 236ms while my own reading said 1.27s. The two measurements were four minutes apart and used different methods; they were never comparable to begin with.
+I hit this while debugging [another problem]({{ '/en/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/' | relative_url }}). A tool reported 236ms, my own test showed 1.27 seconds, and I almost decided the tool couldn't be trusted. Then I noticed the two measurements were 4 minutes apart and used different methods, so they were never comparable.
 
 ## References
 

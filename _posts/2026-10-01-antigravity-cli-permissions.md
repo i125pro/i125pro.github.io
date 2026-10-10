@@ -1,21 +1,19 @@
 ---
-title: "Antigravity CLI Permissions: Allow All, Deny One"
+title: "Antigravity CLI Permissions: Allow All, Deny Only rm"
 lang: en
 permalink: /en/2026/10/01/antigravity-cli-permissions/
-description: "Antigravity CLI permissions match command text, not intent. Control runs confirm command(*) works despite the docs, and denied commands still report SUCCESS."
+description: "One settings.json stops Antigravity CLI from asking before every command and blocks only rm. Tested: the command(*) wildcard works, deny beats always-proceed, and denied headless runs still report SUCCESS, so check for an empty response."
 keywords: ["antigravity cli permissions", "agy cli settings.json", "command(*) wildcard allow rule", "always-proceed toolPermission", "deny command rule", "headless permission denied", "AI agent permission prompts", "denied_actions empty response"]
 mermaid: true
 ---
 
-# Antigravity CLI Permissions: Allow All, Deny One
+# Antigravity CLI Permissions: Allow All, Deny Only rm
 
-The Antigravity CLI (`agy`) asks permission before every command, which is fine for a human at a terminal and useless when you drive it from a script. I wanted one behavior: everything runs, except `rm`.
+By default the Antigravity CLI (`agy`) asks for permission before every command, so driving it from a script means someone has to sit there pressing Enter. What I wanted: every command runs without asking, except `rm`. One config file does it, with one trap to watch for: when a command is denied, it still reports success.
 
-The interesting part is what I found while verifying it. The docs say a certain rule is forbidden. It isn't.
+## The config
 
-## What I changed
-
-One file, `~/.gemini/antigravity-cli/settings.json`:
+Edit `~/.gemini/antigravity-cli/settings.json`:
 
 ```json
 {
@@ -28,34 +26,30 @@ One file, `~/.gemini/antigravity-cli/settings.json`:
 }
 ```
 
-Three fields do the work. `always-proceed` stops the default `request-review` mode from stopping at every command. `allow` with a wildcard lets everything through. `deny` puts one command back on the wall.
+- `toolPermission: "always-proceed"`: turns off the default `request-review` mode, so it stops pausing to ask before each command.
+- `allow: ["command(*)"]`: `*` is a wildcard, meaning any command is allowed.
+- `deny: ["command(rm)"]`: blocks `rm` specifically.
 
-That file is the whole configuration surface. Nothing else needed to change.
+Nothing else needs to change. You could skip the wildcard and list allowed commands one by one (an allowlist), but then every new command shape the agent comes up with needs its own approval, which is exactly the friction I wanted gone.
 
-## The docs say `command(*)` is forbidden
+## command(*) works, even though a note says not to use it
 
-The Antigravity binary ships with embedded guidance for agents writing sidecar configs, and it says this plainly:
+The agy program contains built-in guidance written for an AI, telling it how to generate `sidecar.json` configs. It says:
 
 > Never use overly generic wildcards (`command(*)`, `read_file(*)`, `write_file(*)`, `mcp(*)`, `read_url(*)`).
 
-That text is aimed at an agent generating `sidecar.json` files, where broad grants are a bad idea. It is not a runtime validation rule, and at runtime `command(*)` works.
+That is advice to the AI not to hand out overly broad permissions. It is not a rule the program checks at runtime. I ran two control runs, changing one variable: whether `command(*)` was there.
 
-I did not take the docs' word for it, or my own optimism. I ran a control experiment, twice, changing exactly one variable.
+- With `allow: ["command(*)"]`, running `echo wildcard-test-ok`: succeeded, output `wildcard-test-ok`.
+- With no allow rule, running `echo control-test-ok`: denied, response `""`.
 
-| Config | Command | Result |
-|---|---|---|
-| `allow: ["command(*)"]` | `echo wildcard-test-ok` | Succeeded, output `wildcard-test-ok` |
-| no allow rule | `echo control-test-ok` | Denied, response `""` |
+Both runs showed `"status":"SUCCESS"` and both took about 150 seconds. In the second run the agent read in about 13.8k tokens (tokens are the text units models are metered in) and produced no output at all.
 
-Both runs finished with `"status":"SUCCESS"` and both spent about 150 seconds. In the second run the agent produced **13,792 input tokens and no output at all**. It thought, tried to run a command, was refused, and had nothing left to say.
+This test has to be done in `request-review` mode. Under `always-proceed` every command is allowed anyway, so you can't tell whether the allow rule did anything.
 
-The only difference between the two configs was the presence of `command(*)`.
+## deny takes priority over always-proceed
 
-There is a methodological point buried here. I ran the wildcard test under `request-review`, not under `always-proceed`. Under `always-proceed` every command passes, allowed or not, and the experiment would have told me nothing. The mode that makes denials visible is the only mode where you can test an allow rule.
-
-## deny wins, even against always-proceed
-
-The next run confirmed the ordering. Same session, `always-proceed` active, `command(*)` allowed, two commands issued:
+Next question: when they conflict, which wins? In one session, with `always-proceed` on and `command(*)` allowed, I sent two commands:
 
 ```
 1. echo allow-but-deny-rm          → Succeeded (exit code 0)
@@ -70,9 +64,7 @@ Permission denied for unsandboxed(rm -f /home/xiaoniba/agy-perm-test/probe.txt).
 Matches user-configured deny rule.
 ```
 
-The probe file was still on disk afterward. So `deny` is not a suggestion that `always-proceed` overrides. It wins.
-
-That is the whole design in one behavior: broad allow, one narrow deny, deny evaluated first.
+The file was still there afterward. The order is: deny is checked first, then allow.
 
 ```mermaid
 flowchart TD
@@ -94,11 +86,11 @@ flowchart TD
     style H fill:#3a3320,stroke:#a08a4f,color:#e6e6e6
 ```
 
-## The trap: SUCCESS with an empty response
+Headless in the chart means unattended: nobody is at the terminal to answer a prompt, so any command that isn't allowed is simply denied.
 
-Here is the detail that cost me the most time, and it has nothing to do with permissions.
+## The trap: denied, but it says SUCCESS
 
-A headless run whose command was denied returned this:
+This is where I lost the most time. A headless run whose command was denied returned:
 
 ```json
 {
@@ -109,40 +101,32 @@ A headless run whose command was denied returned this:
 }
 ```
 
-`status` is `SUCCESS`. Exit code was 0. Nothing errored. The agent ran, burned 13.8k tokens, hit a wall, and exited cleanly.
-
-**If your wrapper checks `status == "SUCCESS"`, this reads as a completed task.** It is not a completed task. It is a refusal wearing a success costume.
-
-Check for an empty `response`, or check `denied_actions` is absent. One line, either way:
+`status` is `SUCCESS`, the exit code is 0, and nothing reports an error. If your script only checks `status`, it will think the task finished. Also check that `response` is not empty, or that `denied_actions` is absent:
 
 ```python
 if result.get("status") != "SUCCESS" or not result.get("response", "").strip():
     raise RuntimeError(f"agent produced nothing: {result.get('denied_actions')}")
 ```
 
-An empty final response is never a success. This is the same rule that shows up in every headless agent wrapper, and this tool is no exception.
+Treat an empty response as a failure, always.
 
-## What this is, and what it is not
+## What it protects against, and what it doesn't
 
-Let me be precise about the ceiling, because "allow everything" invites the wrong conclusion.
+These rules match the text of a command, not what the command does. `command(rm)` catches `rm -f ...` because it matches on how the command starts (prefix matching), as the docs describe. It stops an agent from casually typing `rm`. It is not a sandbox (an isolated environment where a program can't touch files outside it).
 
-These rules match **command text**, not intent. `deny: ["command(rm)"]` matched `rm -f ...` by prefix, exactly as documented. What that buys you is protection against an agent casually running `rm` while it thinks. It is not a sandbox.
-
-Specifically, I did not verify whether these paths are also blocked:
+I did not test whether these other ways of deleting files are blocked:
 
 - `find /some/path -delete`
 - `unlink /some/file`
 - `sh -c 'rm ...'`
 
-I started to test them, then stopped, because the test would have the agent actually delete files and a blog post is not worth creating that mess for. Treat those routes as **untested**, not as "blocked." If your threat model is a compromised or careless agent with a filesystem, `deny: command(rm)` is one speed bump, not a wall.
+I started to, then stopped, because the test meant letting the agent actually delete files. Treat them as untested, not as blocked.
 
-What this configuration is actually good for is the honest version: **a trusted machine you own, an agent you chose, and a specific command you never want executed.** That is a real and very common setup, and for it the config above is exactly right.
+So this config fits one situation: your own machine, an agent you chose, and one command you never want run. If you need to guard against untrusted prompts or a shared machine, a longer deny list won't help. Use `--sandbox` with a restricted workspace, and keep anything important out of its reach.
 
-If instead you are protecting against an untrusted prompt or a shared machine, the answer is not a longer deny list. Use `--sandbox` with a restricted workspace, and do not put anything you care about within reach.
+## Confirm in the log that the config loaded
 
-## Verify from the log, not from vibes
-
-Every run writes the settings it loaded. Check them before you trust a config change:
+Every run logs the settings it actually loaded:
 
 ```bash
 grep "CLI settings initialized" "$(ls -t ~/.gemini/antigravity-cli/log/*.log | head -1)"
@@ -152,24 +136,10 @@ grep "CLI settings initialized" "$(ls -t ~/.gemini/antigravity-cli/log/*.log | h
 CLI settings initialized: permissions=&{Allow:[command(*)] Deny:[command(rm)] Ask:[]}, toolPermission=always-proceed
 ```
 
-If that line disagrees with what you wrote, your change did not land. This caught a stale write on my first attempt, before any command ran.
+If that line doesn't match what you wrote, your change didn't get saved. That happened to me the first time, and I caught it from this line before running any command.
 
-## FAQ
+## Further reading
 
-**Does `command(*)` get rejected as an invalid rule?**
-No. It loaded and applied at runtime. The embedded guidance warns against it for generated sidecar configs; it is not enforced.
-
-**Which is better, `always-proceed` or an allowlist?**
-For a trusted personal machine, `always-proceed` plus one `deny`. An allowlist forces you to approve each new command shape the agent invents, which is the friction you were trying to remove.
-
-**Does `deny` work if `always-proceed` is set?**
-Yes, verified. Deny is evaluated first and blocks `rm` while other commands run freely.
-
-**Why did my run say SUCCESS with no output?**
-The command was denied in headless mode. Check `response` is non-empty and `denied_actions` is absent; `status` alone will not catch it.
-
-## Reading
-
-- [Antigravity CLI documentation](https://antigravity.google/docs/cli/reference) — the authoritative settings reference; note where it and the embedded agent guidance diverge
+- [Antigravity CLI documentation](https://antigravity.google/docs/cli/reference): the authoritative settings reference
 - [Antigravity on GitHub](https://github.com/GoogleCloudPlatform/antigravity)
-- [My notes on debugging a different failure by measuring at the wire](https://i125pro.github.io/en/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/) — same discipline, same conclusion: the error message names the wrong suspect, and only single-variable control runs find the real one
+- [Another debugging write-up: the error pointed at the server, the real cause was downstream](https://i125pro.github.io/en/2026/09/30/cloudflare-sni-blocking-preferred-ip-dead/): also solved by control runs that change one variable at a time

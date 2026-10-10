@@ -1,36 +1,26 @@
 ---
-title: "Cloudflare Preferred-IP Nodes All Dead: Don't Swap IPs, It's Your Domain"
+title: "Cloudflare Preferred-IP Nodes All Dead: Don't Swap IPs, Swap the Domain"
 lang: en
 permalink: /en/:year/:month/:day/:title/
-description: "Ten preferred-IP nodes all returned RST in the same minute, but the IPs were fine, the origin was fine, and Cloudflare was fine. A middlebox matches the string in the TLS SNI field and kills the connection. Includes a 30-second self-test, the five-place fix, and the traps."
+description: "Ten preferred-IP nodes dropped at once, yet the IPs, the origin and Cloudflare were all fine: something on the path matched the domain in the TLS handshake (SNI) and killed the connection. This post covers a 30-second self-test, the five places to change for a new domain, and how I tracked it down."
 keywords: ["SNI blocking detection", "connection reset by peer", "tcpdump troubleshooting", "cloudflare preferred ip", "SNI reset", "network fault isolation", "preferred ip new domain"]
 mermaid: true
 ---
 
-Late on 2026-09-30, all ten preferred-IP nodes in my subscription died within the same minute. I had changed nothing.
+In the early hours of 30 September 2026, all ten Cloudflare preferred-IP nodes in my subscription dropped within the same minute. I hadn't touched any config. Six hours of digging later, it turned out the IPs, the origin and Cloudflare were all fine. The problem was the domain: a device on the path reads the domain name in the TLS handshake and kills any connection containing `cc.cd`. Changing IPs or servers does nothing. The only fix is a new domain.
 
-Over the next six hours I proved that almost every piece of received wisdom in the preferred-IP world was wrong.
+Domains in this post are placeholders. The `198.41.x.x` and `104.x.x.x` addresses are Cloudflare's public anycast addresses (the same IPs shared by many data centres worldwide), not secrets.
 
-Here is the conclusion up front, so you don't have to scroll:
+## 30-second self-test: is this your problem?
 
-> **Nothing was broken.** The IPs were healthy. The origin was healthy. Cloudflare was healthy.
-> Something in the middle of the path reads the hostname in the TLS handshake and kills the connection on a string match.
-> **Swapping IPs won't help. Swapping servers won't help. The only fix is a new domain.**
-
-The rest is ordered by what you probably need: a 30-second self-test first, then why, then the fix, and only then how I worked it out.
-
-> Domains and IPs are replaced with documentation ranges per RFC 2606 (`.example`) and RFC 5737 (`203.0.113.x`) so the commands can be pasted as-is. The `198.41.x.x` and `104.x.x.x` addresses shown are Cloudflare's public anycast ranges, not secrets.
-
-## The 30-second self-test
-
-Set these two variables once; every command below can then be copied verbatim:
+Set two variables:
 
 ```bash
 DOMAIN=cdn.your-domain.com      # the domain that is failing
 EDGE_IP=198.41.209.164          # any Cloudflare anycast edge IP
 ```
 
-Now hit two different domains through **the same edge IP**:
+Then hit two domains through the same edge IP. `--resolve` tells curl to skip DNS and send that domain straight to the IP you give it:
 
 ```bash
 # [diagnose] a domain known to be fine, confirms the IP itself is alive
@@ -44,111 +34,94 @@ curl -sS -o /dev/null -w "$DOMAIN -> %{http_code}\n" --max-time 8 \
   "https://$DOMAIN/"
 ```
 
-There are only three possible combinations, and they mean completely different things:
+There are three possible outcomes:
 
-| 1st | 2nd | What you observe | What it means |
-|---|---|---|---|
-| `200` | `200` | both work | Nodes are fine, look at your subscription, config, or client |
-| `200` | `000` | same IP, a different domain works | **This is the bug.** The domain is being killed; the IP is irrelevant |
-| `000` | `000` | neither works | That edge IP is unreachable; try another one |
+| 1st | 2nd | Meaning |
+|---|---|---|
+| `200` | `200` | The nodes are fine; check your subscription, config or client |
+| `200` | `000` | This post's problem: same IP, a different domain works, so it's the domain being killed |
+| `000` | `000` | That edge IP itself is unreachable; try another |
 
-Note that the second result is `000`, not `403` or `404`. **`000` means curl never even got an HTTP status code, the connection died before the TLS handshake completed.** That distinction matters: it separates "the server returned an error" from "something outside killed the connection".
+`000` means curl never got an HTTP status code at all; the connection died before the encrypted handshake finished. That's different from the server sending back a `403` or `404`. Those mean the server got your request and refused it. `000` looks more like someone cut the line halfway.
 
-If you landed on the second row, jump to [the fix](#fix).
+## Why changing the IP doesn't help
 
-## Plain language: what SNI is, and why it can be blocked
+When you open an HTTPS site, the first handshake packet your client sends is called the ClientHello. It contains a field called SNI (Server Name Indication) holding the domain you want. The server needs it because one IP can host thousands of sites, and without the name it can't tell which certificate to present.
 
-When you visit `https://example.com`, your browser has to tell the server "I'm here for example.com". That sentence goes in the very first packet of the TLS handshake (the ClientHello), in a field called SNI (Server Name Indication).
+The catch is that SNI is sent in plaintext. Encryption only starts once the handshake is done, and SNI has to go out before that. Think of a letter: the contents are sealed inside the envelope, but the address is written on the outside where anyone handling it can read it. A device on the path doesn't need to decrypt anything. It reads that string, matches it against a list, and acts on a hit. This time the hit was the five characters `cc.cd`.
 
-The reason it exists is practical: a single IP can host tens of thousands of sites, and the server needs the name to know which certificate to present.
+That's why the usual fixes fail:
 
-The problem: **SNI is plaintext.** Encryption only starts after the handshake is negotiated, and SNI has to go out before that. Any device on the path can therefore see which domain you're connecting to, no decryption required, just read the string.
+- Changing the preferred IP: only the IP changes. The domain in the SNI is the same and still matches.
+- Changing VPS or provider: I tested from a different provider in a different region and got exactly the same result. The server was never the problem.
+- Enabling TLS fragmentation (`fragment`, which splits the ClientHello into several small packets): reassembling them is easy for a middlebox. I tested with it on and still got cut off.
+- Waiting for Cloudflare to lift a ban: Cloudflare hadn't banned anything. The same IP with another domain returns 200.
 
-That makes blocking extremely cheap: take a list of domains, do substring matching, and act on a hit. In this case the match was the five characters `cc.cd`. It really is that crude.
+One more piece of evidence: on the same server and the same ports, my REALITY nodes (a protocol that disguises its handshake by borrowing another site's domain; mine used `www.nvidia.com`) never dropped once, because their handshake has no string to match. The blocking happens between the client and the Cloudflare edge and has nothing to do with your server.
 
-**One thing people get wrong:** it's tempting to assume that since SNI is read during the handshake, the block must happen at the SYN stage. But reading SNI requires the TCP handshake to be complete and the ClientHello to be on the wire. So what actually happens is not "your SYN gets dropped", it's "you get let in, they read who you're asking for, and then they kill the connection". That difference determines where you go looking (see [how I confirmed it](#evidence)).
+## The fix: a new domain, changed in 5 places
 
-## Three things that sound like fixes and don't work
+My setup is VLESS behind Cloudflare's orange cloud (proxy mode, where traffic passes through Cloudflare before reaching the origin). In this setup the domain is hardcoded at every layer, so switching domains means five edits.
 
-If you already tried these, don't second-guess yourself, they can't work:
+You need to be able to change Cloudflare DNS, SSH into the origin and reissue the origin certificate, and your client (router, mihomo or a GUI client) must be able to change its subscription URL. Make the changes in order, then verify once at the end.
 
-| What you'd try | Why it fails |
-|---|---|
-| A different preferred IP | Preferred-IP tooling changes the IP; the domain is untouched. The string is still in the SNI, and it still matches |
-| A different VPS or provider | Same reasoning. I tested an unrelated machine at a different provider in a different region: identical RST. The variable was never the server |
-| Enabling TLS fragmentation (`fragment`) | Fragmentation splits the ClientHello across TCP segments, but reassembling them is cheap for a middlebox. I had it enabled; the reset arrived anyway |
-| Waiting for Cloudflare to "lift the ban" | Cloudflare banned nothing. The same IP with a different domain returns 200 |
+### 1. DNS
 
-In one line: **as long as you keep using that domain, the matching rule in the middle of the path stays satisfied.**
-
-There's a telling piece of corroboration: on the same server and the same ports, the REALITY nodes, which borrow `www.nvidia.com` as their SNI, never failed once, because there is nothing in their ClientHello to match. The interference lives on the client-to-edge hop. Your server was never involved.
-
-## The fix: a new domain, in five places {#fix}
-
-In a "Cloudflare orange cloud + VLESS" setup, the domain is **hardcoded in every layer**. Changing it is not one edit; it's five.
-
-**Prerequisites:** you can change DNS (Cloudflare dashboard), SSH into the origin, and reissue the origin certificate. The client side (router / mihomo / whatever GUI) must also be able to change its subscription URL.
-
-Do them in this order, then verify once at the end.
-
-### ① DNS (Cloudflare)
+In the Cloudflare dashboard, add a record with the orange cloud on:
 
 ```
-A   new.your-domain.com   →   <your origin IP>   proxied = true
+A   new.your-domain.com   →   <your origin IP>   proxied = true (orange cloud on)
 ```
 
-The API token needs exactly one permission: **Zone → DNS → Edit**.
+If you use the API, the token needs just one permission: Zone → DNS → Edit.
 
-### ② Origin certificate (add the new domain)
+### 2. Origin certificate
 
-Reissue the certificate with both old and new names in the SAN, so the old domain keeps working and you can roll back:
+Reissue the certificate with both the old and new domains in the SAN (the field listing which domains a certificate is valid for). Keeping the old one makes rollback easy:
 
 ```
 DNS:old.your-domain.com, DNS:new.your-domain.com, DNS:*.new.your-domain.com
 ```
 
-> **Trap 1: the certificate and the key are two separate files.** Replace the certificate without the key and you get `sslv3 alert handshake failure`, an error that looks exactly like a Cloudflare-side problem and will send you hunting in the wrong place. **Replace them as a pair.**
->
-> **Trap 2: Cloudflare's encryption mode must be `full`, not `strict`.** A self-signed origin certificate cannot pass strict validation.
+The certificate and private key are two separate files and must be replaced as a pair. Replace only the certificate and the handshake fails with `sslv3 alert handshake failure`, an error that looks very much like a Cloudflare problem and sends you in the wrong direction.
 
-### ③ nginx
+Also, set Cloudflare's encryption mode to `full`, not `strict`. A self-signed origin certificate can't pass strict validation.
 
-Add the new name to the 443 server block and keep the old one:
+### 3. nginx
+
+Add the new domain to the 443 server block and keep the old one:
 
 ```nginx
 server_name old.your-domain.com old-cdn.your-domain.com new.your-domain.com;
 ```
 
-### ④ xray / 3x-ui inbound (the most expensive step)
+### 4. xray / 3x-ui inbound
 
-The WS inbound hard-checked `host = old domain`, so the new hostname returned a flat 404.
+This step took the longest. The WebSocket inbound had `host = old domain` hardcoded, so the new domain got a 404 every time.
 
-This is the biggest trap in the whole job: **3x-ui persists inbound settings in SQLite and regenerates `config.json` from that database on every restart. Editing `config.json` directly is silently reverted, no error, nothing.**
+The trap: 3x-ui stores inbound settings in an SQLite database and regenerates `config.json` from it on every restart. Edit `config.json` by hand and your changes are quietly reverted, with no error. The right way:
 
-The correct sequence:
-
-1. Edit `/etc/x-ui/x-ui.db`, table `inbounds`, field `stream_settings`, and remove `wsSettings.host` (let nginx split by `$host` instead);
+1. Edit `stream_settings` in the `inbounds` table of `/etc/x-ui/x-ui.db` and remove `wsSettings.host`, leaving nginx to route multiple domains by `$host`;
 2. Restart the panel;
-3. **Kill the stale xray process still holding port 10086**, the old process keeps the port and never reloads the config.
+3. Kill the old xray process still holding port 10086. Otherwise it keeps the port and the new config never takes effect.
 
-All three steps are required, and the first two fail **without any error message**. If your change appears to do nothing, it's almost certainly this.
+Getting the first two steps wrong produces no error at all. If your change seems to do nothing, this is most likely why.
 
-### ⑤ Subscription generator and consumer
+### 5. Subscription generator and downstream
 
-The `sni` / `host` values baked into the generated VLESS links:
+The `sni` and `host` values written into the generated VLESS links need to be the new domain. The cron entry has to carry the environment variables too, or a scheduled run will quietly overwrite the subscription back to the old domain:
 
 ```bash
-# the cron entry must carry the env vars, or a scheduled run will silently
-# overwrite the subscription back to the old domain
 5 0,6 * * * VLESS_SNI=new.your-domain.com VLESS_HOST=new.your-domain.com /usr/bin/python3 subgen.py
 ```
 
-Downstream consumers (a router running mihomo, for example) need their subscription URL updated too.
+Downstream subscription URLs (mihomo on a router, for example) need to point at the new domain as well.
 
-### How to verify
+### Verify
+
+Send a real WebSocket upgrade request. Only a `101` (the server agreeing to switch to WebSocket) counts as a pass:
 
 ```bash
-# [verify] a real WebSocket upgrade, 101 is the only pass
 curl -sk -o /dev/null -w "%{http_code}\n" \
   -H "Connection: Upgrade" -H "Upgrade: websocket" \
   -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
@@ -156,168 +129,82 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
   "https://new.your-domain.com/cfws-<your-path>"
 ```
 
-My actual result: both old and new domains return `101`, the subscription pulls 14 nodes all of which pass, the live proxy measures 0.40s, and direct latency went from "all failing" to 67–133ms.
+After my changes, both old and new domains returned `101`, the subscription pulled 14 nodes that all worked, the proxy measured 0.40s, and direct latency went from all failing to 67–133ms.
 
-## How I confirmed it {#evidence}
+## How I tracked it down {#evidence}
 
-None of the above is a guess, but the method here may be worth more than the conclusion. Next time a batch of things dies at once, this is the order to work in.
+### Ruling out the server
 
-### 1. Rule out "the server is dead"
+First I bypassed the CDN and connected straight to the origin IP. Still cut off. But the origin itself was fine: at the same time, from the origin machine through the Cloudflare edge with the same domain, I got `HTTP/1.1 101 Switching Protocols`. nginx was running, 443 was listening, ufw allowed it, and the logs were clean.
 
-Everyone's first instinct. I bypassed the CDN and hit the origin IP directly: still RST. But the origin was perfectly fine, at the same moment, from the origin itself through the Cloudflare edge with the same hostname, the response was `HTTP/1.1 101 Switching Protocols`. nginx alive, port 443 listening, ufw allowing, logs clean.
+### Same IP, different domains
 
-**"The service refused you" and "the service never received you" look completely different**, and that distinction is what eventually cracked the case.
+This was the key step. Using one edge IP, I changed only the domain in the ClientHello:
 
-### 2. Fix the IP, vary only the domain (the decisive step)
+- `speed.cloudflare.com` returned `200 OK`.
+- `de5.net`, `cwu.cc`, `bbroot.com`, `i.cd`, `us.ci`, `bot.cd` and `kz.ci` returned a TLS alert.
+- `cc.cd` got a straight Connection reset.
 
-This was the turning point. Same edge IP, only the name in the ClientHello changes:
+A TLS alert and a reset are different things. A TLS alert is a refusal message from Cloudflare: the request reached Cloudflare and was handled normally, with no interference. An RST is TCP's "disconnect now" signal, and a clean RST in the middle of a handshake means someone outside cut the connection.
 
-| SNI in the ClientHello | Result | Reading |
-|---|---|---|
-| `speed.cloudflare.com` | `200 OK` | not interfered with |
-| `de5.net` / `cwu.cc` / `bbroot.com` / `i.cd` / `us.ci` / `bot.cd` / `kz.ci` | TLS alert | reached Cloudflare; refused normally, by Cloudflare |
-| `cc.cd` | **Connection reset** | killed from outside |
-
-**The two failure modes must not be confused:**
-
-- **TLS alert** = a packet from Cloudflare. The request reached the edge and was handled normally. No interference.
-- **A clean RST** = the connection was killed mid-handshake. Interference.
-
-### 3. Pin the rule down to a literal string
-
-Two more probes fix the matching granularity:
+Two more tests showed how precise the matching is:
 
 ```bash
 # .cd but not cc.cd  →  survives
 curl --resolve abc123def.cd:443:$EDGE_IP https://abc123def.cd/
 
-# cc.cd but the hostname does not exist (made up on the spot)  →  reset
+# cc.cd, but a hostname that doesn't exist (made up on the spot)  →  reset
 curl --resolve randxyz.cc.cd:443:$EDGE_IP https://randxyz.cc.cd/
 ```
 
-Conclusion: **the match is the literal five characters `cc.cd`.** Not the `.cd` TLD, not my specific hostname, not the IP, and not the port, it fires on 443, on 8443, and on port 80 via the plaintext `Host` header.
+So the match is on the characters `cc.cd`, regardless of the `.cd` suffix, my actual hostname or the IP. The port doesn't matter either: 443 and 8443 trigger it, and so does `cc.cd` in the plaintext `Host` header on port 80.
 
-### 4. Packet capture at the origin: where I made a mistake
+### I used the wrong capture filter
 
-This one deserves its own paragraph, because it nearly sent me down the wrong path.
-
-The filter I originally used:
+At first I captured on the origin like this:
 
 ```bash
 tcpdump -ni any "tcp[tcpflags] & (tcp-syn|tcp-rst) != 0 and tcp dst port 443" -vv -c 20
 ```
 
-`tcp dst port 443` only shows packets sent to the origin. But the origin's own replies have source port 443 and destination port = the client's ephemeral port, so **they can never match that rule**. I briefly concluded "the origin sent nothing back", when in fact my filter simply couldn't see the origin's replies.
-
-The correct form:
+`tcp dst port 443` only captures packets whose destination port is 443, meaning packets sent to the origin. The origin's replies go from port 443 to the client's ephemeral port (a random port the client picks for each connection), so they never match. For a while I believed the origin had sent nothing back, when really the filter just couldn't see it. The correct version:
 
 ```bash
 sudo tcpdump -ni any port 443 -vv -c 20
 ```
 
-The two packets actually captured (timestamps made relative):
+The two packets captured (timestamps made relative):
 
 ```
 [S]   ← client → origin SYN, arrives normally
 [R.]  ← 283ms later, source address shows the client itself
 ```
 
-### 5. The causal chain that actually holds
+### What actually happened
 
 ```mermaid
 flowchart TD
-    A["TCP handshake already complete<br/>client knows the origin's ISN"] --> B["Client sends ClientHello<br/>SNI = cc.cd"]
-    B --> C["Middlebox reads the SNI, matches the rule"]
-    C --> D["Injects forged RST at both ends"]
+    A["TCP handshake already complete<br/>client knows the origin's initial sequence number"] --> B["Client sends ClientHello<br/>SNI = cc.cd"]
+    B --> C["Middlebox reads the SNI, matches its list"]
+    C --> D["Injects forged RST toward both ends"]
     D --> E["curl reports<br/>Connection reset by peer"]
 ```
 
-A few key points:
+A TCP connection is set up with a three-way handshake: the client sends SYN, the server replies SYN-ACK, and the client confirms. The RST carried `ack = 486385868`, a sequence number that could only have come from the origin's SYN-ACK, so the handshake really did complete. That fits: to read the SNI, the connection has to be up and the ClientHello sent. The blocking works by letting you connect, reading the domain and then cutting you off, not by dropping the SYN at the start.
 
-- That RST carries `ack = 486385868`. **That sequence number could only have come from the origin's SYN-ACK.** In other words, the TCP handshake genuinely completed; the SYN-ACK really did come back.
-- So "the SYN was dropped and the origin was never contacted" **does not hold up.** Reading the SNI *requires* a completed handshake and a ClientHello on the wire.
-- 283ms is roughly one RTT. That's far too fast to be a timeout (a timeout means waiting a full second, see point 6).
-- That "RST from the client" is very likely **forged by the middlebox**; injecting RST toward both ends is the standard technique for this class of device. I can't prove that part beyond doubt (a forged packet's source address simply reads as the client's), but it's the only hypothesis that explains every observation at once.
+283ms is about one RTT (the time for a packet to make a round trip), far too fast to be a timeout. The RST that appears to come from the client was most likely forged by the middlebox; injecting RSTs toward both ends is common practice for this kind of device. I can't fully prove it, since a forged packet's source address looks exactly like the client's, but it's the only explanation that fits everything I saw. If you can reproduce it, run `sudo tcpdump -ni any port 443 -vv` on both ends at once and you'll see which side the RST comes in from, and when.
 
-**The honest conclusion: the symptom is certain (a match on `cc.cd` kills the connection), and the mechanism is "read the SNI, then inject RST", not "drop the SYN".** If you can reproduce this in your own environment, capture at both ends with `sudo tcpdump -ni any port 443 -vv` and you'll see directly which side the RST comes from and when.
+### A measurement trap I found along the way
 
-### 6. A second trap I walked into (now its own post)
+While investigating I took 5 samples in a row. The third was 1.26s; the rest were around 0.23s. This has nothing to do with SNI: Linux waits `TCP_TIMEOUT_INIT` = 1.0 second before retransmitting the first SYN, so if that first packet is lost you sit there for a full second. 1.0s plus a real RTT of 0.23s is exactly 1.26s. A speed test that averages only the successful attempts will report a node with 25% packet loss as a healthy 230ms. The details are in a separate post: [One sample lied by 5x: the Linux 1-second SYN retransmission trap](/en/2026/10/01/syn-rto-measurement-trap/).
 
-During the investigation I took five consecutive samples. The third read 1.26s; all the others sat around 0.23s, a 5x gap.
+## Mistakes I made
 
-This has nothing to do with SNI. It's a fixed kernel behaviour: **Linux's initial SYN retransmission timeout, `TCP_TIMEOUT_INIT`, is 1.0 second.** Lose the first SYN once and you wait the full second. `1.26s = 1.0s waiting + 0.23s real RTT`, the arithmetic checks out.
-
-What makes it dangerous is that **the mean hides the worst case**: any benchmark that does several handshakes and averages only the successes will report a node with 25% packet loss as a healthy 230ms.
-
-I split that one into its own post: **[One sample lied by 5x: the Linux 1-second SYN retransmission trap →](/en/2026/10/01/syn-rto-measurement-trap/)**
-
-## Traps I walked into
-
-1. An hour wasted hunting firewall rules on the origin. The symptom pointed at "the server refused me" (`Connection reset by peer` reads exactly like a server-side refusal), so I went looking for a server-side refusal. **That message lied about where the problem was.** What broke the loop was stopping to ask: ten nodes died at the same moment, what do they share? They don't share an IP, a provider, a port, or a config file. They share exactly one thing: the hostname in the ClientHello. **When a batch of similar things dies together, the cause is usually the thing they share.**
-2. Edited `config.json` and nothing happened. 3x-ui regenerates it from SQLite. Editing the wrong file produces no error at all.
-3. Replaced the certificate without the key, got `sslv3 alert handshake failure`, and it looked like Cloudflare was down.
-4. Compared two incomparable measurements and wrongly concluded the benchmarking tool was unreliable. The two readings were four minutes apart and used different methods (multi-run average vs a single `time_connect`), they were never comparable.
-5. Drew a conclusion from a single sample. See point 6 above.
-
-## Appendix: command reference
-
-```bash
-# ---- variables ----
-DOMAIN=cdn.your-domain.com
-EDGE_IP=198.41.209.164
-
-# ---- [diagnose] same IP, two domains: is the domain being killed? ----
-curl -sS -o /dev/null -w "speed.cloudflare.com -> %{http_code}\n" --max-time 8 \
-  --resolve speed.cloudflare.com:443:$EDGE_IP \
-  "https://speed.cloudflare.com/__down?bytes=1000000"
-curl -sS -o /dev/null -w "$DOMAIN -> %{http_code}\n" --max-time 8 \
-  --resolve $DOMAIN:443:$EDGE_IP "https://$DOMAIN/"
-
-# ---- [diagnose] two-sided capture at the origin (do NOT add dst port 443) ----
-sudo tcpdump -ni any port 443 -vv -c 20
-
-# ---- [verify] WebSocket upgrade; you want 101 ----
-curl -sk -o /dev/null -w "%{http_code}\n" \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  --resolve new.your-domain.com:443:$EDGE_IP \
-  "https://new.your-domain.com/cfws-<your-path>"
-```
-
-## For agents and automation
-
-If you're feeding this post to an agent and asking it to reproduce the fix, hand it this section:
-
-```text
-Decision rule
-  Same edge IP, different SNI:
-    speed.cloudflare.com -> 200  AND  your domain -> 000(reset)
-    ⇒ the domain is being killed by SNI string matching.
-  Once you see that combination, stop investigating IPs, servers, and Cloudflare.
-
-Required actions, in order
-  1. New domain: add a proxied=true A record in Cloudflare
-  2. Reissue the origin cert with the new name in the SAN; replace cert AND key together;
-     Cloudflare encryption mode = full
-  3. nginx: append the new name to server_name on the 443 block (keep the old one)
-  4. Edit /etc/x-ui/x-ui.db, table inbounds.stream_settings, remove wsSettings.host;
-     restart the panel; kill the stale xray still holding port 10086
-  5. subgen.py: VLESS_SNI / VLESS_HOST (cron entry needs the env vars too)
-  6. Point downstream subscription URLs at the new domain
-
-Do NOT do (verified useless)
-  Swap preferred IPs / swap VPS / swap provider / enable TLS fragmentation /
-  wait for Cloudflare to lift a ban
-  Hunt for firewall rules on the origin
-
-Failure modes to avoid
-  - Adding `tcp dst port 443` to tcpdump hides the origin's replies and produces a
-    false "the origin sent nothing" conclusion
-  - Hand-editing 3x-ui's config.json is silently reverted; SQLite is the source of truth
-  - Mismatched cert/key ⇒ sslv3 alert handshake failure
-  - The mechanism is "read the ClientHello SNI, then inject RST", not "drop the SYN".
-    Being able to read the SNI implies the TCP handshake already completed.
-```
+1. I spent an hour looking for firewall rules on the origin. `Connection reset by peer` sounds like the server refusing me, but it wasn't. What helped was asking a different question: ten nodes died at once, so what do they have in common? Their IPs, providers, ports and config files all differed. The only shared thing was the domain in the handshake. When a batch of similar things breaks at the same time, the cause is usually in the part they share.
+2. I edited `config.json` and nothing changed. 3x-ui regenerates it from SQLite, and editing the wrong file gives no warning.
+3. I replaced the certificate but not the private key, got `sslv3 alert handshake failure`, and it looked like Cloudflare was down.
+4. I compared two numbers that weren't comparable and wrongly blamed the speed-test tool. The two measurements were 4 minutes apart and used different methods (a multi-run average versus a single run), so they never belonged side by side.
+5. I drew a conclusion from a single measurement. See the measurement trap above.
 
 ## References
 

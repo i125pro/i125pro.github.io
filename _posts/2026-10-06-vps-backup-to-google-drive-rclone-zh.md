@@ -1,61 +1,42 @@
 ---
-title: "用 rclone 把 VPS 备份到 Google Drive：完整可复现流程"
+title: "用 rclone 把 VPS 每天备份到 Google Drive"
 lang: zh
 permalink: /zh/:year/:month/:day/vps-backup-to-google-drive-rclone/
-description: "把 VPS 和家目录主机备份到 Google Drive 的完整可复现流程：自建 client_id、无头服务器授权、增量同步、cron 定时与失败告警。附两个真实踩过的坑及其根因分析——手工注入 token 导致无法续期、nginx sites-enabled 里的文件不一定是符号链接。"
+description: "用 rclone 把一台 VPS 和一台家用服务器每天增量备份到 Google Drive 的完整步骤，从自建 client_id 到 cron 定时和 Telegram 告警。另附两个坑：手工写入 token 导致一小时后 401，以及 nginx sites-enabled 里的文件不是符号链接。"
 keywords: ["rclone备份", "Google Drive备份", "VPS备份", "rclone authorize", "rclone无头服务器", "rclone 401", "Google Drive API", "nginx sites-enabled", "Linux备份脚本", "crontab 增量备份", "rclone 自建client_id"]
 mermaid: true
 ---
 
-我想把两台 Linux 机器备份到 Google Drive：一台 4.9G 的 VPS（跑着 x-ui、cloudflare_temp_email、memory-tree），一台家里的主力机（跑着二十多个 Docker 容器）。
+我想把两台 Linux 机器备份到 Google Drive：一台 4.9G 的小 VPS（跑着 x-ui、cloudflare_temp_email、memory-tree），一台家里的主力机（跑着二十多个 Docker 容器）。最后用 rclone 做成了每天凌晨自动增量备份、失败发 Telegram 通知。配置不难，最关键的一点：token 要用 `rclone authorize` 生成，别自己拼，否则一小时后就会报 401。下面按操作顺序写，命令都能直接复制。
 
-rclone 的文档写得清楚，配置本身不难。这篇文章按**你实际会执行的顺序**给出所有步骤，从申请 client_id 到 cron 定时，每一步都能复制就跑。
+## 准备
 
-文章的最后一节写了我真正栽跟头的两个地方，以及它们的根因——包括一个我一开始归因完全错误的 bug。
+一个 Google 账号，一台能开浏览器的电脑（用来点授权），以及 VPS 的 SSH 访问权。
 
-**前置条件**
+## 第一步：申请自己的 client_id
 
-```
-1. 一个 Google 账号
-2. 一台能开浏览器的电脑（本地笔记本即可，用来完成 OAuth 授权）
-3. 目标机器的 SSH 访问权（备份 VPS 时需要）
-```
-
----
-
-## 0. 申请自己的 client_id（先做这步，因为在控制台里最花时间）
-
-2026 年必须自建。rclone 官方文档原文：
+client_id 是 rclone 访问你云盘时用的"应用身份证"。rclone 自带的公共 client_id 今年要停用，[官方文档](https://rclone.org/drive/)原话：
 
 > The shared client_id is being retired and will stop working during 2026, so creating your own is now strongly recommended.
 
-（我在 [rclone.org/drive/](https://rclone.org/drive/) 上确认了这句话在三个地方出现，包括 `--drive-client-id` 参数说明。）
+1. 打开 [Google Cloud Console](https://console.cloud.google.com/)，新建一个项目。
+2. **APIs and Services → Library**，搜 `Google Drive API`，点 **Enable**。最容易漏，漏了会报 `Error 403: googleapi: Error 403: ... SERVICE_DISABLED`。
+3. **OAuth consent screen**（授权时看到的确认页）选 External，填应用名和两个邮箱。
+4. **Credentials → Create Credentials → OAuth client ID**，Application type 选 **Desktop app**。
+5. 记下 `client_id` 和 `client_secret`。
 
-**流程：**
+个人自用（少于 100 个用户）不用过 Google 审核，应用停在 Testing 状态即可，授权页提示"Google 尚未验证此应用"时点 **高级 → 继续前往**。Testing 的唯一影响是 token 可能有期限：我拿到的带着 `refresh_token_expires_in: 604799`，即 7 天。发布到 Production 后这个字段就没了。
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → 新建项目
-2. **APIs and Services → Library** → 搜索 `Google Drive API` → **Enable**
-   - 这步最容易漏。漏了会在调用时报 `Error 403: googleapi: Error 403: ... SERVICE_DISABLED`
-3. **OAuth consent screen** → External → 填应用名、支持邮箱、开发者邮箱
-4. **Credentials → Create Credentials → OAuth client ID** → Application type 选 **Desktop app**
-5. 记下 `client_id` 和 `client_secret`
+## 第二步：在本地电脑上拿 token
 
-**关于审核**：个人自用（少于 100 用户）**不需要通过 Google 的验证审核**。OAuth 应用保持在 Testing 状态就能授权，只会在授权页顶部显示「Google 尚未验证此应用」，点 **高级 → 继续前往** 即可。
-
-Testing 状态唯一的实际影响是：`refresh_token` 可能带一个有效期字段，我拿到的那个是 `refresh_token_expires_in: 604799`（7 天）。发布到 Production 后这个字段消失，token 变永久。你自己决定要不要折腾发布。
-
----
-
-## 1. 拿 token（无头服务器的标准做法）
-
-服务器上没有浏览器，所以这一步要用 rclone 提供的 `authorize` 命令 —— **在本地能开浏览器的机器上跑**，而不是在服务器上。
+OAuth 授权后 Google 给两样东西：`access_token` 是临时门票，一小时过期；`refresh_token` 是会员卡，随时能换新门票。rclone 会自己换。服务器没有浏览器，所以授权在本地电脑上做：
 
 ```bash
 # 在你的本地电脑上执行（不是服务器）
 rclone authorize "drive" "<client_id>" "<client_secret>"
 ```
 
-命令会打印一个 URL，在浏览器里打开完成授权，然后终端里输出一大段 JSON。它长这样：
+在浏览器打开它打印的链接并同意，终端会输出一段 JSON：
 
 ```json
 {
@@ -67,13 +48,9 @@ rclone authorize "drive" "<client_id>" "<client_secret>"
 }
 ```
 
-**把这整段 JSON 留好**，下一步要用。
+整段存好。注意 `expiry` 字段，坑一会讲它为什么要紧。
 
-> ⚠️ 如果你想在服务器上用 curl 直接调 Google 的 token 接口，需要自己处理这个 JSON —— 那条路会踩坑，见第 6 节。用 `rclone authorize` 就没这个问题。
-
----
-
-## 2. 服务器上的 rclone 配置
+## 第三步：在服务器上配置 rclone
 
 ```bash
 mkdir -p ~/.config/rclone && chmod 700 ~/.config/rclone
@@ -81,7 +58,7 @@ rclone config      # 选 n 新建 → 名字填 gdrive → 类型选 drive → �
 chmod 600 ~/.config/rclone/rclone.conf
 ```
 
-或者直接手写配置文件（`rclone config` 生成的等价物）：
+或者直接手写配置文件：
 
 ```ini
 [gdrive]
@@ -89,29 +66,21 @@ type = drive
 scope = drive
 client_id = <你的 client_id>.apps.googleusercontent.com
 client_secret = <你的 client_secret>
-token = <第 1 步拿到的整段 JSON>
+token = <第二步拿到的整段 JSON>
 team_drive =
 config_is_local = false
 ```
 
-**权限必须是 600** —— 里面有能读写你整个云盘的 refresh_token。
-
-**关于 scope**：个人备份用 `drive`（全域）。`drive.file` 只能访问该应用自己创建的文件，rclone 列举目录和比对已有文件时会受限。
-
-**验证**：
+权限必须是 600，里面的 refresh_token 能读写整个云盘。scope（授权范围）用 `drive`；`drive.file` 只能看到应用自己建的文件，rclone 列目录、比对文件会受限。验证：
 
 ```bash
 rclone lsd gdrive:
 rclone about gdrive:      # 看剩余空间和已用量
 ```
 
----
+## 第四步：备份 VPS，不经过本机磁盘
 
-## 3. 备份远端 VPS（不落本机磁盘）
-
-rclone 支持 `:sftp,host=...` 连接串，可以从 SSH 直接读远端、写到云端，中间不落盘 —— VPS 磁盘只剩 743M 的时候这个很关键。
-
-前提：VPS 上已配置好 SSH 公钥免密登录，且 sshd 支持 SFTP 子系统（默认支持）。
+rclone 能通过 SFTP（走 SSH 的文件传输）从 VPS 边读边传，不落盘。我的 VPS 只剩 743M，这点很关键。前提是配好 SSH 密钥免密登录（SFTP 默认开启）。
 
 ```bash
 #!/usr/bin/env bash
@@ -142,13 +111,11 @@ rclone copy "$SRC/" "$DEST" "${EXCL[@]}" \
   --stats 30s --stats-one-line
 ```
 
-排除项的逻辑：虚拟文件系统（不可读）、临时文件、日志和包缓存（可重建）、以及 `node_modules` / `.npm` / `.cache`（`npm install` 就能回来）。VPS 上这三类加起来约 165M。
+`flock` 是文件锁，上次没跑完就跳过。排除的是读不了的虚拟目录、临时文件、能重建的日志和包缓存，以及 `node_modules`、`.npm`、`.cache`（`npm install` 就回来），后三类在我的 VPS 上约 165M。
 
----
+## 第五步：备份本机，只备丢了就得重做的东西
 
-## 4. 本机增量备份（只备不可再生的）
-
-我本机 56G 已用。原则是**只备丢了就得重新做或重新配的东西**：
+本机已用 56G，只备丢了就得手工重做或重配的东西：
 
 ```bash
 SOURCES=(
@@ -174,13 +141,11 @@ for s in "${SOURCES[@]}"; do
 done
 ```
 
-排掉 `overlay2` 和 `venv` 之后，本机从 24G 降到 12.8G。
+排掉 `overlay2` 和 `venv` 后，从 24G 降到 12.8G。`/var/lib/docker/volumes` 千万别排除，容器的数据库和凭证都在里面。
 
-`/var/lib/docker/volumes` 是最不能排除的一项 —— 里面那些数据库和凭证丢了是真的得重新配。`overlay2` 里的镜像层 `docker pull` 一下就回来了。
+## 第六步：每天定时跑，失败发通知
 
----
-
-## 5. 定时 + 失败告警
+两个脚本存为 `~/bin/vps-gdrive-backup.sh` 和 `~/bin/local-gdrive-backup.sh`，再写个总脚本：
 
 ```bash
 #!/usr/bin/env bash
@@ -211,27 +176,19 @@ VPS $(rclone size gdrive:backup/vps | tail -1)
 本机 $(rclone size gdrive:backup/local | tail -1)"
 ```
 
-crontab：
+crontab，每天 05:30：
 
 ```bash
 30 5 * * * /home/<user>/bin/daily-gdrive-backup.sh >>/tmp/daily-backup.log 2>&1
 ```
 
-**关于频率**：`rclone copy` 靠文件大小和 mtime 判断要传什么，扫 14 万个目录项要十几分钟，但实际传输只有变化的部分（通常几十 MB）。每日跑的实际成本比直觉低得多。
+- 每天跑不贵。`rclone copy` 靠文件大小和修改时间找变化，扫 14 万个目录项要十几分钟，实际只传几十 MB。
+- 小文件多会很慢。Drive 限制每秒请求数，十万个文件就是十万次请求。我实测从 `130 KiB/s` 爬到 `1.28 MiB/s`，瓶颈在 Drive，不在带宽。
+- 日常增量碰不到配额。首次全量如果撞上，rclone 会明确报配额错误而不是悄悄少传，隔天再跑会接着传。
 
-**关于速度**：Drive 对大量小文件的 API 调用有限流。我实测速率从 `130 KiB/s` 爬到 `1.28 MiB/s` —— 这不是本地带宽，是 Drive 的 QPS 限制（十万个文件就是十万次请求）。所以「扫目录很久」和「实际只传了几十 MB」可以同时成立。
+## 坑一：自己拼的 token，一小时后开始 401
 
-**关于配额**：上传额度因账号类型而异，不是一个固定的小数字。日常增量几十 MB 完全不用担心。首轮 18G 确实超出了一般个人账号的日额度，分几天传完就行（rclone 会报配额错误而不是静默截断）。
-
----
-
-## 6. 我真正栽跟头的两个地方
-
-前面五步顺利的话你不会碰到这两个。但我遇到了，所以写下来。
-
-### 6.1 手工注入 token 导致无法续期
-
-**症状**
+我一开始没用 `rclone authorize`，结果上传整整一小时后开始报错：
 
 ```bash
 $ rclone copy ./data gdrive:backup/
@@ -241,24 +198,14 @@ $ rclone copy ./data gdrive:backup/
   googleapi: Error 401: Request had invalid authentication credentials.
 ```
 
-**为什么会这样**
-
-我在无头服务器上没法跑 `rclone authorize`，于是用 curl + Python 自己请求 Google 的 token 接口，然后把返回的原始 JSON 直接写进 `rclone.conf`。
-
-问题出在两段代码之间的**契约**：
-
-OAuth 2.0 规范（[RFC 6749 §5.1](https://datatracker.ietf.org/doc/html/rfc6749#section-5.1)）规定 token 响应用 `expires_in`（相对秒数）表示寿命，**不包含绝对时间戳**。Google 严格遵守这个规范。
-
-而 rclone 用的是 Go 的 `oauth2` 库，它在拿到 token 时会自己算：
+当时我用 curl 加 Python 自己请求 Google 的 token 接口，把返回的原始 JSON 直接写进 `rclone.conf`。问题是这份 JSON 没有 `expiry`：按 OAuth 2.0 规范（[RFC 6749 §5.1](https://datatracker.ietf.org/doc/html/rfc6749#section-5.1)），寿命用 `expires_in`（还剩多少秒）表示，不带具体时刻。rclone 用的 Go `oauth2` 库会在拿到 token 时自己换算：
 
 ```go
 // golang.org/x/oauth2/internal/token.go
 Expiry: time.Now().Add(time.Duration(expiresIn) * time.Second)
 ```
 
-也就是说，**`rclone authorize` 生成的 JSON 里是有 `expiry` 字段的**，因为 rclone 在写文件前已经算好了。我手工灌进去的原始 JSON 没有这个字段，rclone 读到零值 `time.Time{}`。
-
-rclone 判断要不要刷新的逻辑（`lib/oauthutil/oauthutil.go`）：
+所以 `rclone authorize` 的输出有 `expiry`，我手写的没有，rclone 读到空值。它判断何时刷新的代码（`lib/oauthutil/oauthutil.go`）：
 
 ```go
 func (ts *TokenSource) timeToExpiry() time.Duration {
@@ -273,13 +220,9 @@ func (ts *TokenSource) timeToExpiry() time.Duration {
 }
 ```
 
-零值 → 返回 95 年 → 刷新定时器设成 95 年 → **永不刷新**。它就一直拿着那个一小时后就失效的 `access_token` 硬用。
+空值被当作 95 年后过期，于是永不刷新，一直拿着过期门票硬闯。这是我绕开正常流程造成的，解决办法就是用 `rclone authorize` 重拿 token。
 
-源码里的注释 `// ~95 years` 就是「永不过期」的白纸黑字表述。
-
-**所以这不是 Google 的 bug，也不是 rclone 的 bug，是我用非标准方式注入数据造成的。** 正确做法就是第 1 节的 `rclone authorize`。
-
-**验证方法**（以后遇到类似的 401 可以先跑这个）
+以后遇到类似 401，可以绕开 rclone 直接试试会员卡还能不能换门票：
 
 ```bash
 # 绕开 rclone，直接问 Google 能不能换到新 token
@@ -295,17 +238,13 @@ curl -s https://oauth2.googleapis.com/token \
   -d refresh_token="$RT"
 ```
 
-能换到新的 `access_token` → refresh_token 是好的，问题在客户端的过期判断。
+能拿到新 `access_token`，说明 refresh_token 没问题，毛病在 rclone 的过期判断。
 
-**顺便说一个我一开始的应急 hack**：我手工把 `expiry` 写成 `2020-01-01T00:00:00Z`、`access_token` 写成字符串 `"stale"`，强制它走刷新路径。这确实能跑通，但**不要用在生产** —— 那是给非标准注入数据打的补丁，正确解法是用 `rclone authorize` 重新拿一份。（另一个细节：`access_token` 不能留空，留空 rclone 会报 `token expired and there's no refresh token`，因为它读到空 access_token 就认为整个 token 结构无效。）
+我当时的救急办法是把 `expiry` 改成 `2020-01-01T00:00:00Z`、`access_token` 改成 `"stale"`，逼它刷新。能用，但别长期这么干。`access_token` 不能留空，否则 rclone 会报 `token expired and there's no refresh token`。
 
-### 6.2 nginx `sites-enabled` 里的文件不一定是符号链接
+## 坑二：nginx 的 sites-enabled 里不一定是符号链接
 
-这个和备份无关，但它让「Google 品牌审核一直不通过」多烧了六个小时 —— 记下来是因为它足够隐蔽。
-
-**症状**：审核页面报「首页在登录页后面」「app name 不匹配」「隐私政策内容不足」，但我 curl 实测 200、标题正确、内容够长。报错和实测逐条矛盾。
-
-排查后发现裸路径返回 502：
+这个和备份无关，但让我在过 Google 品牌审核时多耗了六小时。审核一直报"首页在登录页后面""app name 不匹配""隐私政策内容不足"，我用 curl 测却是 200、标题对、内容够长。后来发现不带尾部斜杠的路径返回 502：
 
 ```bash
 for u in "https://example.com/oauth/" "https://example.com/oauth"; do
@@ -318,9 +257,7 @@ https://example.com/oauth/    code=200
 https://example.com/oauth     code=502    ← 这里
 ```
 
-`location /oauth/` 只匹配带尾斜杠的，裸路径落到 `location /` 上。加上 `location = /oauth` 就好了。
-
-**但这不是全部原因。** 查生效配置发现：
+`location /oauth/` 只匹配带斜杠的地址，`/oauth` 落到了 `location /`。加一条 `location = /oauth` 就好。但改完一直不生效，用 `nginx -T`（打印实际加载的全部配置）一查：
 
 ```bash
 $ sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
@@ -329,22 +266,18 @@ $ sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
 # configuration file /etc/nginx/sites-enabled/mysite.bak-20260930:  ← 也在加载
 ```
 
-两个发现：
-
-**第一**：`include /etc/nginx/sites-enabled/*;` 用 glob 展开（nginx 文档说 include 支持 `mask` 通配），目录里所有非隐藏文件都会被加载 —— 包括 `.bak`。旧配置和备份同时生效。
-
-**第二**，也是真正浪费我时间的：
+第一个问题：`include /etc/nginx/sites-enabled/*;` 的 `*` 会加载目录下所有非隐藏文件，包括 `.bak`，新旧配置同时生效。第二个才是真正耗时间的：
 
 ```bash
 $ ls -la /etc/nginx/sites-enabled/mysite
 -rw-r--r-- 1 root root 13047 /etc/nginx/sites-enabled/mysite
 ```
 
-**它不是符号链接**，是普通文件。而我一直在改 `/etc/nginx/sites-available/mysite`。两个独立的副本，改一个对另一个没有任何影响 —— `nginx -t` 每次通过，`systemctl reload nginx` 每次成功，**只是完全改的是另一个文件**。
+它是普通文件，不是符号链接（类似快捷方式，改原文件就等于改它）。我一直改的是 `/etc/nginx/sites-available/mysite`，两份是独立副本，`nginx -t` 和 `systemctl reload nginx` 每次都成功，改的却不是在用的那个。
 
-需要说明的是：`sites-available` / `sites-enabled` 这套约定是 **Debian / Ubuntu 的打包惯例**，nginx 官方配置里只有 `conf.d/*.conf`。也就是说这两个目录名在「约定」层面绑定，在「文件系统」层面不绑定 —— 任何时候 `cp` 代替 `ln -s` 都会静默失去绑定关系。
+`sites-available` 放配置、`sites-enabled` 放链接，只是 Debian / Ubuntu 的打包约定，nginx 官方只有 `conf.d/*.conf`。当初谁用 `cp` 代替了 `ln -s`，绑定就悄悄断了。
 
-**正确处理方式**（我博客初稿里写的「改成 `include sites-available/*.conf`」是错的，那会把所有草稿配置全量加载）：
+处理办法（别改成 `include sites-available/*.conf`，那会把所有草稿都加载进来）：
 
 ```bash
 # 1. 找出非符号链接的文件
@@ -353,20 +286,18 @@ find /etc/nginx/sites-enabled/ -maxdepth 1 -type f ! -type l -print
 # 2. 把 include 的通配符收紧到 *.conf，只加载 .conf
 #    include /etc/nginx/sites-enabled/*.conf;
 
-# 3. 清理 .bak 文件
+# 3. 列出非 .conf 的文件（如 .bak），确认后清理
 find /etc/nginx/sites-enabled/ -type f ! -name '*.conf' -print
 ```
 
-**教训：改 nginx 前先确认哪个文件真正生效。**
+收紧之后，要用的配置也得以 `.conf` 结尾才会加载，最好顺手换成指向 `sites-available` 的符号链接。以后改 nginx 前先确认哪个文件在生效：
 
 ```bash
 sudo nginx -T 2>/dev/null | grep -E '^# configuration file'
 ls -la /etc/nginx/sites-enabled/
 ```
 
----
-
-## 7. 最终状态
+## 最终结果
 
 ```
 VPS   gdrive:backup/vps      5.94 GB   110,728 个文件
@@ -374,9 +305,4 @@ VPS   gdrive:backup/vps      5.94 GB   110,728 个文件
 cron  每天 05:30，带 token 预检和失败告警
 ```
 
-首轮约 8 小时（18G，13 万文件），之后每天几十 MB。
-
-两个坑一句话版：
-
-1. **别手工往 `rclone.conf` 里塞 Google 的原始 token JSON** —— 用 `rclone authorize`，它会自己把 `expires_in` 换算成 `expiry`。少这一步，rclone 源码里 `timeToExpiry()` 会把零值当成「95 年」，于是永不刷新，一小时后开始 401。
-2. **改 nginx 前先 `nginx -T`** —— `sites-enabled` 里的文件可能不是符号链接，而 `include *` 会把 `.bak` 一起加载。
+第一次全量约 8 小时（18G，13 万文件），之后每天几十 MB。
