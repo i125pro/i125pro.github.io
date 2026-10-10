@@ -51,3 +51,4 @@ exclude:
   - node_modules
   - vendor
   - tools/
+  - WRITING_GUIDE.md
