@@ -1,6 +1,26 @@
+// Self-hosted, SIL OFL 1.1 (licenses in assets/fonts/)
 @font-face {
-  font-family: "Plantin MT Pro";
-  src: local("Georgia");
+  font-family: "Commit Mono";
+  src: url("../fonts/commit-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Commit Mono";
+  src: url("../fonts/commit-mono-700.woff2") format("woff2");
+  font-weight: 600 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Departure Mono";
+  src: url("../fonts/departure-mono.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
 }
 
 * {
@@ -68,4 +88,11 @@ code, pre, kbd {
   max-width: 860px;
   margin: 0 auto;
   padding: 0 1.5rem;
+}
+
+// Wide uppercase tracking is meant for Latin labels; it pulls Chinese apart.
+:lang(zh) .site-nav a,
+:lang(zh) .hero-subtitle,
+:lang(zh) .archive-year {
+  letter-spacing: 0.02em;
 }

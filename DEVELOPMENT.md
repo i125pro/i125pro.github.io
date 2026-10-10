@@ -60,9 +60,10 @@
 - `--text: #252f3df5` `--accent: #4b607c` `--line: #25303c33`
 
 ### 字体
-- `--font-serif: "Plantin MT Pro", "Plantin MT Std", Plantin, Georgia, serif` — 正文/标题（本机无该商业字体，回退到 Georgia）
-- `--font-mono: "Commit Mono", "SFMono-Regular", Consolas, monospace` — 代码/UI
-- `--font-mono-accent: "Departure Mono", "Commit Mono", monospace` — 导航/标签大写小字（letter-spacing: 0.08em）
+- 自托管（SIL OFL 1.1，许可证在 `assets/fonts/`）：`Commit Mono`（400/700，代码与 UI）、`Departure Mono`（导航/标签）。
+- `--font-serif`：英文正文 Georgia；中文页面（`:root:lang(zh)`）改用系统无衬线 `--font-sans`，避免宋体和 Georgia 混排。
+- `--font-cjk`：苹方 / 冬青黑 / 微软雅黑 / Noto Sans CJK，只引用系统字体，不分发文件。所有字体栈都以它兜底中文。
+- 不要再引入 Plantin 等商业字体。
 
 ### 视觉特效
 - `body::before` — 网格纸背景纹理（repeating-linear-gradient 横竖各一条，24px 间距）
