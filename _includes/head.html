@@ -16,6 +16,12 @@
       document.documentElement.setAttribute('data-theme', stored || system);
     })();
   </script>
+  {%- assign lang = page.lang | default: site.default_lang -%}
+  {%- if lang == "zh" %}
+  <!-- LXGW WenKai Screen (SIL OFL 1.1), split by unicode-range so only the glyphs a page uses are downloaded -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-screen-webfont@1.7.0/lxgwwenkaigbscreen.css">
+  {%- endif %}
   <link rel="stylesheet" href="{{ '/assets/css/main.css' | relative_url }}">
   {% feed_meta %}
   {% seo %}

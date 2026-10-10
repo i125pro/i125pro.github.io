@@ -71,3 +71,19 @@
 ## 参考样例
 
 `rewrite-posts` 分支里的四篇技术文（Cloudflare SNI、Antigravity CLI 权限、SYN 重传、rclone 备份）是按这份指南改过的版本，可以对照着写。
+
+## 字体
+
+全部免费可商用，改字体时同步更新本节和 `DEVELOPMENT.md`。
+
+| 用途 | 字体 | 协议 | 加载方式 |
+|---|---|---|---|
+| 英文正文 / 标题 | Source Serif 4（400 / 600 / 700，400 斜体） | SIL OFL 1.1 | 自托管 `assets/fonts/` |
+| 中文正文 / 标题 | 霞鹜文楷屏幕版 GB（LXGW WenKai Screen） | SIL OFL 1.1 | jsDelivr CDN，按 unicode-range 分片，只在中文页面加载 |
+| 代码 / UI | Commit Mono（400 / 700） | SIL OFL 1.1 | 自托管 |
+| 导航 / 标签 | Departure Mono | SIL OFL 1.1 | 自托管 |
+| 兜底 | 苹方 / 冬青黑 / 微软雅黑 / Noto Sans CJK | 系统自带 | 不分发 |
+
+- 字体栈定义在 `_sass/_tokens.scss`，`@font-face` 在 `_sass/base.scss`，文楷的 CSS 链接在 `_includes/head.html`。
+- 许可证文件放在 `assets/fonts/LICENSE-*.txt`。
+- 不要引入商业字体（例如 Plantin）。

@@ -60,9 +60,10 @@
 - `--text: #252f3df5` `--accent: #4b607c` `--line: #25303c33`
 
 ### 字体
-- 自托管（SIL OFL 1.1，许可证在 `assets/fonts/`）：`Commit Mono`（400/700，代码与 UI）、`Departure Mono`（导航/标签）。
-- `--font-serif`：英文正文 Georgia；中文页面（`:root:lang(zh)`）改用系统无衬线 `--font-sans`，避免宋体和 Georgia 混排。
-- `--font-cjk`：苹方 / 冬青黑 / 微软雅黑 / Noto Sans CJK，只引用系统字体，不分发文件。所有字体栈都以它兜底中文。
+详见 README「字体」一节。要点：
+- `--font-serif`：`"Source Serif 4", Georgia, "LXGW WenKai Screen", <系统中文>`，英文落在 Source Serif 4，中文落在霞鹜文楷。
+- Source Serif 4 / Commit Mono / Departure Mono 自托管在 `assets/fonts/`（SIL OFL 1.1）。
+- 霞鹜文楷屏幕版通过 jsDelivr（`lxgw-wenkai-screen-webfont@1.7.0/lxgwwenkaigbscreen.css`）按需分片加载，仅 `lang: zh` 页面引入（`_includes/head.html`）。
 - 不要再引入 Plantin 等商业字体。
 
 ### 视觉特效

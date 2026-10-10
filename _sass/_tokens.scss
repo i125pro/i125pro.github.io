@@ -10,18 +10,12 @@
   --accent-rust: #8f3222;
   --line: #49505980;
 
-  // Chinese falls back to the reader's system CJK font (nothing is shipped).
+  // System CJK fonts: last-resort fallback for Chinese (nothing is shipped).
   --font-cjk: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei";
-  --font-serif: Georgia, "Times New Roman", var(--font-cjk), serif;
+  --font-serif: "Source Serif 4", Georgia, "LXGW WenKai Screen", var(--font-cjk), serif;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, var(--font-cjk), sans-serif;
   --font-mono: "Commit Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, var(--font-cjk), monospace;
   --font-mono-accent: "Departure Mono", "Commit Mono", ui-monospace, Menlo, Consolas, var(--font-cjk), monospace;
-}
-
-// Chinese pages: a CJK serif next to Georgia looks patchy and SimSun is hard to
-// read on screen, so body text and headings use the system sans stack.
-:root:lang(zh) {
-  --font-serif: var(--font-sans);
 }
 
 [data-theme="light"] {
